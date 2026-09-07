@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+*.tsbuildinfo
+.agentSpace/
+.DS_Store
+*.bat
+test_*.mjs
+test_*.js

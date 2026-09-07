@@ -1,0 +1,35 @@
+# DSH Devin-CLI bundle patch
+#
+# 把本机 Devin CLI 注册为 DSH 的 LLM provider route。
+# 通过 stdio ACP 协议与本地 devin 子进程通信。
+
+- insert:
+    - id: devin-cli
+      name: dsh-devin-cli
+      config:
+        devinBin: "devin"
+        workspace: "."
+        streamIdleTimeoutMs: 300000
+        token: ""
+        defaultContextWindow: 200000
+        defaultMaxTokens: 65536
+        models:
+          - id: "glm-5-2"
+            name: "GLM-5.2"
+            description: "Devin GLM-5.2 reasoning model"
+            contextWindow: 200000
+            maxTokens: 65536
+            supportsImages: false
+          - id: "swe-1-7"
+            name: "SWE-1.7"
+            description: "Devin SWE-1.7 coding model with vision support"
+            contextWindow: 262000
+            maxTokens: 65536
+            supportsImages: true
+        retryPolicy:
+          mode: normal
+          maxRetries: 3
+          backoff:
+            initialDelayMs: 500
+            maxDelayMs: 10000
+            jitterRatio: 0.1
