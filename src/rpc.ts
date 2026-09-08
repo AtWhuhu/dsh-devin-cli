@@ -54,13 +54,32 @@ async function probeCliVersion(bin: string): Promise<{ online: boolean; version:
  */
 export function installDevinRpc(ctx: Context, options: DevinRpcOptions = {}): void {
   const fallbackBin = options.devinBin ?? 'devin'
-  const cachedModels: DiscoveredModel[] = []
+  let cachedModels: DiscoveredModel[] = []
+  let inFlightDiscovery: Promise<DiscoveredModel[]> | null = null
 
   const ensureModels = async (bin: string, signal?: AbortSignal): Promise<DiscoveredModel[]> => {
-    if (cachedModels.length === 0) {
-      cachedModels.push(...(await discoverDevinModels(bin, signal)))
+    if (cachedModels.length > 0) {
+      return cachedModels
     }
-    return cachedModels
+    if (inFlightDiscovery) {
+      return inFlightDiscovery
+    }
+    inFlightDiscovery = (async () => {
+      try {
+        const raw = await discoverDevinModels(bin, signal)
+        const map = new Map<string, DiscoveredModel>()
+        for (const m of raw) {
+          if (m?.id && !map.has(m.id)) {
+            map.set(m.id, m)
+          }
+        }
+        cachedModels = Array.from(map.values())
+        return cachedModels
+      } finally {
+        inFlightDiscovery = null
+      }
+    })()
+    return inFlightDiscovery
   }
 
   const handleRpc = async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<ConnectionRpcResult<unknown>> => {
@@ -90,7 +109,8 @@ export function installDevinRpc(ctx: Context, options: DevinRpcOptions = {}): vo
           return { ok: true, value: { ok: true, models, activeModelIds: settings.activeModelIds } }
         }
         case 'refresh': {
-          cachedModels.length = 0
+          cachedModels = []
+          inFlightDiscovery = null
           const models = await ensureModels(bin, signal)
           return { ok: true, value: { ok: true, total: models.length, models } }
         }

@@ -63,31 +63,42 @@ export class DevinModelRegistry {
   private variantMap = new Map<string, DevinVariant>()
   private familyMap = new Map<string, DevinFamily>()
   private initialized = false
+  private initPromise: Promise<void> | null = null
 
   async init(devinBin = 'devin', signal?: AbortSignal): Promise<void> {
-    try {
-      const { stdout } = await execFileAsync(devinBin, ['models', 'list', '--format', 'json'], {
-        signal,
-        timeout: 25_000,
-        maxBuffer: 15 * 1024 * 1024,
-        windowsHide: true,
-      })
-      const data = JSON.parse(stdout) as { families?: any[] }
-      this.loadFromJsonFamilies(data.families || [])
-      this.initialized = true
-    } catch (err) {
-      console.warn('[DevinModelRegistry] Failed to fetch live models, using fallback defaults:', err)
-      this.loadFallback()
-    }
+    if (this.initialized && this.families.length > 0) return
+    if (this.initPromise) return this.initPromise
+    this.initPromise = (async () => {
+      try {
+        const { stdout } = await execFileAsync(devinBin, ['models', 'list', '--format', 'json'], {
+          signal,
+          timeout: 25_000,
+          maxBuffer: 15 * 1024 * 1024,
+          windowsHide: true,
+        })
+        const data = JSON.parse(stdout) as { families?: any[] }
+        this.loadFromJsonFamilies(data.families || [])
+        this.initialized = true
+      } catch (err) {
+        console.warn('[DevinModelRegistry] Failed to fetch live models, using fallback defaults:', err)
+        this.loadFallback()
+      } finally {
+        this.initPromise = null
+      }
+    })()
+    return this.initPromise
   }
 
   loadFromJsonFamilies(rawFamilies: any[]): void {
     this.families = []
     this.variantMap.clear()
     this.familyMap.clear()
+    const seenFamilies = new Set<string>()
 
     for (const fam of rawFamilies) {
-      const fUid = String(fam.family_uid || fam.slug || '')
+      const fUid = String(fam.family_uid || fam.slug || '').trim()
+      if (!fUid || seenFamilies.has(fUid.toLowerCase())) continue
+      seenFamilies.add(fUid.toLowerCase())
       const fLabel = String(fam.family_label || fUid || 'Devin')
       const variants: DevinVariant[] = []
       const effortMap = new Map<string, { id: string; name: string; variantUid: string; contextWindow?: number }>()

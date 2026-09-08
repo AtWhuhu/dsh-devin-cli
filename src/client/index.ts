@@ -104,7 +104,11 @@ export function apply(ctx: ClientContext): void {
         }
         const md = await fetchModels(conn)
         if (md?.models) {
-          setModels(md.models)
+          const map = new Map<string, ModelItem>()
+          for (const m of md.models) {
+            if (m?.id && !map.has(m.id)) map.set(m.id, m)
+          }
+          setModels(Array.from(map.values()))
           if (md.activeModelIds) {
             setActiveIds(new Set(md.activeModelIds))
           }
@@ -128,8 +132,13 @@ export function apply(ctx: ClientContext): void {
       setRefreshing(true)
       try {
         const json = await rpcCall<{ ok: boolean; models: ModelItem[] }>(conn, 'refresh')
-        setModels(json.models)
-        showToast(`已重新探测，发现 ${json.models.length} 个可用模型`)
+        const map = new Map<string, ModelItem>()
+        for (const m of json.models || []) {
+          if (m?.id && !map.has(m.id)) map.set(m.id, m)
+        }
+        const unique = Array.from(map.values())
+        setModels(unique)
+        showToast(`已重新探测，发现 ${unique.length} 个可用模型`)
       } catch (e) {
         showToast(`探测失败: ${e instanceof Error ? e.message : String(e)}`)
       } finally {
@@ -166,12 +175,21 @@ export function apply(ctx: ClientContext): void {
       setActiveIds(new Set())
     }
 
-    const activeModelList = models.filter((m) => activeIds.has(m.id))
+    // 严格按 ID 去重，杜绝已选模型标签重复出现
+    const activeModelList = Array.from(
+      new Map(models.filter((m) => activeIds.has(m.id)).map((m) => [m.id, m])).values(),
+    )
     const baseList = filterTab === 'active' ? activeModelList : models
+    const uniqueBaseList = Array.from(new Map(baseList.map((m) => [m.id, m])).values())
     const query = searchQuery.trim().toLowerCase()
     const filteredModels = query
-      ? baseList.filter((m) => m.id.toLowerCase().includes(query) || m.name?.toLowerCase().includes(query))
-      : baseList
+      ? uniqueBaseList.filter((m) => {
+          const idMatch = (m.id || '').toLowerCase().includes(query)
+          const nameMatch = (m.name || '').toLowerCase().includes(query)
+          const effortMatch = (m.efforts || []).some((e) => (e || '').toLowerCase().includes(query))
+          return idMatch || nameMatch || effortMatch
+        })
+      : uniqueBaseList
 
     return h(
       'div',
@@ -586,25 +604,78 @@ export function apply(ctx: ClientContext): void {
           ),
         ),
 
-        // 搜索框
-        h('input', {
-          type: 'text',
-          value: searchQuery,
-          onChange: (e: any) => setSearchQuery(e.target.value),
-          placeholder: '搜索模型名称或 ID，例如 claude, glm, swe, gpt, deepseek, gemini...',
-          style: {
-            width: '100%',
-            boxSizing: 'border-box',
-            background: 'var(--bg-input, rgba(0,0,0,0.2))',
-            border: '1px solid var(--border-color, rgba(255,255,255,0.12))',
-            borderRadius: '6px',
-            padding: '8px 12px',
-            color: 'inherit',
-            fontSize: '13px',
-            marginBottom: '14px',
-            outline: 'none',
+        // 搜索框容器
+        h(
+          'div',
+          {
+            style: {
+              position: 'relative',
+              width: '100%',
+              marginBottom: '10px',
+            },
           },
-        }),
+          h('input', {
+            type: 'text',
+            value: searchQuery,
+            onChange: (e: any) => setSearchQuery(e.target?.value ?? ''),
+            onInput: (e: any) => setSearchQuery(e.target?.value ?? ''),
+            placeholder: '搜索模型名称或 ID，例如 claude, glm, swe, gpt, deepseek, gemini...',
+            style: {
+              width: '100%',
+              boxSizing: 'border-box',
+              background: 'var(--bg-input, rgba(0,0,0,0.2))',
+              border: '1px solid var(--border-color, rgba(255,255,255,0.12))',
+              borderRadius: '6px',
+              padding: '8px 36px 8px 12px',
+              color: 'inherit',
+              fontSize: '13px',
+              outline: 'none',
+            },
+          }),
+          searchQuery
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  title: '清空搜索',
+                  onClick: () => setSearchQuery(''),
+                  style: {
+                    position: 'absolute',
+                    right: '10px',
+                    top: '50%',
+                    transform: 'translateY(-50%)',
+                    background: 'transparent',
+                    border: 'none',
+                    color: '#94a3b8',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    padding: '2px 6px',
+                    lineHeight: '1',
+                  },
+                },
+                '✕',
+              )
+            : null,
+        ),
+
+        // 搜索匹配状态提示
+        query
+          ? h(
+              'div',
+              {
+                style: {
+                  fontSize: '12px',
+                  color: '#93c5fd',
+                  marginBottom: '10px',
+                  paddingLeft: '2px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                },
+              },
+              `🔍 搜索 "${searchQuery}"：找到 ${filteredModels.length} 个匹配模型`,
+            )
+          : null,
 
         // 滚动列表
         h(
@@ -617,7 +688,22 @@ export function apply(ctx: ClientContext): void {
               borderRadius: '6px',
             },
           },
-          filteredModels.map((m) => {
+          filteredModels.length === 0
+            ? h(
+                'div',
+                {
+                  style: {
+                    padding: '36px 16px',
+                    textAlign: 'center',
+                    color: 'var(--text-secondary, #94a3b8)',
+                    fontSize: '13px',
+                  },
+                },
+                query
+                  ? `未找到与 "${searchQuery}" 相关的模型，请尝试更换搜索词`
+                  : '暂无可用模型',
+              )
+            : filteredModels.map((m) => {
             const checked = activeIds.has(m.id)
             return h(
               'div',
