@@ -504,6 +504,33 @@ export class DevinAdapter extends LlmAdapter {
       // 跟踪在途工具调用：toolCallId -> { callSeq, name }
       const activeToolCalls = new Map<string, { callSeq: number; name: string }>()
 
+      // 跟踪是否发生过工具调用，以保证调用轨迹自上而下正确排列（杜绝正文超前锚定导致工具沉底）
+      let hasToolCalls = false
+      let initialThoughtBuffer = ''
+      let initialTextBuffer = ''
+      let bypassToolBuffering = false
+
+      const flushInitialBuffers = function* (): Generator<StreamChunk, void, unknown> {
+        if (bypassToolBuffering) return
+        bypassToolBuffering = true
+        if (initialThoughtBuffer) {
+          const { index, startChunk, endChunk } = ensureBlock('reasoning')
+          if (endChunk) yield endChunk
+          if (startChunk) yield startChunk
+          currentBlock!.content += initialThoughtBuffer
+          yield { type: 'reasoning-delta', index, text: initialThoughtBuffer }
+          initialThoughtBuffer = ''
+        }
+        if (initialTextBuffer) {
+          const { index, startChunk, endChunk } = ensureBlock('text')
+          if (endChunk) yield endChunk
+          if (startChunk) yield startChunk
+          currentBlock!.content += initialTextBuffer
+          yield { type: 'text-delta', index, text: initialTextBuffer }
+          initialTextBuffer = ''
+        }
+      }
+
       const endCurrentBlock = (): StreamChunk | null => {
         if (!currentBlock) return null
         const closed = {
@@ -556,20 +583,18 @@ export class DevinAdapter extends LlmAdapter {
           break
         }
 
-        // 处理深度思考流 (纯净思考过程，绝不混入任何工具调用杂质)
-        if (update.sessionUpdate === 'agent_thought_chunk') {
-          const thought = update as { content?: { type?: string; text?: string } }
-          const text = thought.content?.text
-          if (text) {
-            const { index, startChunk, endChunk } = ensureBlock('reasoning')
-            if (endChunk) yield endChunk
-            if (startChunk) yield startChunk
-            currentBlock!.content += text
-            yield { type: 'reasoning-delta', index, text }
-          }
-        }
         // 处理工具调用开始：以 DSH 原生独立事件发射，在前端渲染为独立的工具调用卡片消息体
-        else if (update.sessionUpdate === 'tool_call') {
+        if (update.sessionUpdate === 'tool_call') {
+          hasToolCalls = true
+          // 既然触发了工具调用，丢弃工具前暂存的零碎过渡短语或心声，防止在工具前建立过早的时间锚点导致工具卡片沉底
+          initialThoughtBuffer = ''
+          initialTextBuffer = ''
+          bypassToolBuffering = true
+
+          // 如果之前有尚未关闭的块，关闭它
+          const endChunk = endCurrentBlock()
+          if (endChunk) yield endChunk
+
           const tc = update as {
             title?: string
             kind?: string
@@ -633,17 +658,61 @@ export class DevinAdapter extends LlmAdapter {
             }
           }
         }
+        // 处理深度思考流
+        else if (update.sessionUpdate === 'agent_thought_chunk') {
+          const thought = update as { content?: { type?: string; text?: string } }
+          const text = thought.content?.text
+          if (text) {
+            if (!hasToolCalls && !bypassToolBuffering) {
+              // 纯对话阶段探测：暂存心声
+              initialThoughtBuffer += text
+            } else if (hasToolCalls) {
+              // 工具已经发生：仅当所有工具调用完成之后输出的总结性深度思考，才在工具下方正常展现
+              if (activeToolCalls.size === 0) {
+                const { index, startChunk, endChunk } = ensureBlock('reasoning')
+                if (endChunk) yield endChunk
+                if (startChunk) yield startChunk
+                currentBlock!.content += text
+                yield { type: 'reasoning-delta', index, text }
+              }
+            } else {
+              // 确认无工具调用的纯对话
+              const { index, startChunk, endChunk } = ensureBlock('reasoning')
+              if (endChunk) yield endChunk
+              if (startChunk) yield startChunk
+              currentBlock!.content += text
+              yield { type: 'reasoning-delta', index, text }
+            }
+          }
+        }
         // 处理正文回复流
         else if (update.sessionUpdate === 'agent_message_chunk') {
           const chunk = update as AcpAgentMessageChunk
           const contents = Array.isArray(chunk.content) ? chunk.content : [chunk.content]
           for (const content of contents) {
             if (content.type === 'text' && content.text) {
-              const { index, startChunk, endChunk } = ensureBlock('text')
-              if (endChunk) yield endChunk
-              if (startChunk) yield startChunk
-              currentBlock!.content += content.text
-              yield { type: 'text-delta', index, text: content.text }
+              if (!hasToolCalls && !bypassToolBuffering) {
+                initialTextBuffer += content.text
+                // 如果文字积累已长（超过 80 字），说明不是工具前简短过渡短语，而是直接回答
+                if (initialTextBuffer.length > 80) {
+                  yield* flushInitialBuffers()
+                }
+              } else if (hasToolCalls) {
+                // 如果发生过工具调用：仅当在途工具全部完成时，在工具下方流式输出最终结论正文
+                if (activeToolCalls.size === 0) {
+                  const { index, startChunk, endChunk } = ensureBlock('text')
+                  if (endChunk) yield endChunk
+                  if (startChunk) yield startChunk
+                  currentBlock!.content += content.text
+                  yield { type: 'text-delta', index, text: content.text }
+                }
+              } else {
+                const { index, startChunk, endChunk } = ensureBlock('text')
+                if (endChunk) yield endChunk
+                if (startChunk) yield startChunk
+                currentBlock!.content += content.text
+                yield { type: 'text-delta', index, text: content.text }
+              }
             }
           }
         }
@@ -660,6 +729,11 @@ export class DevinAdapter extends LlmAdapter {
             }
           }
         }
+      }
+
+      // 纯对话场景下若缓冲区仍有残留内容，在流收尾前输出
+      if (!hasToolCalls && !bypassToolBuffering) {
+        yield* flushInitialBuffers()
       }
 
       // 确保收尾在途尚未接收到完成回执的工具卡片，避免前端卡片一直等待
