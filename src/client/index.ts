@@ -56,10 +56,10 @@ interface StatusPayload {
   }
 }
 
-async function rpcCall<T>(conn: ConnectionRpc, endpoint: string, payload?: unknown): Promise<T> {
+async function rpcCall<T>(conn: ConnectionRpc, endpoint: string, payload: unknown = {}): Promise<T> {
   let result: RpcResultLike
   try {
-    result = await conn.call('/api', `devin-cli/${endpoint}`, payload)
+    result = await conn.call('/devin-cli', endpoint, payload ?? {})
   } catch (err) {
     throw new Error(`无法连接 Devin CLI 服务: ${err instanceof Error ? err.message : String(err)}`)
   }

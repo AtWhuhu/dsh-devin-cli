@@ -20,11 +20,10 @@ export type ConnectionRpcResult<T> =
 
 interface HostConnectionLike {
   rpc: {
-    intercept(
-      channel: '/api',
-      matches: (endpoint: string) => boolean,
+    handle(
+      channel: string,
       handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<ConnectionRpcResult<unknown>>,
-    ): () => Promise<void>
+    ): () => void
   }
 }
 
@@ -114,14 +113,12 @@ export function installDevinRpc(ctx: Context, options: DevinRpcOptions = {}): vo
 
   ctx.inject(['connection'], (connCtx) => {
     const connection = (connCtx as unknown as { connection: HostConnectionLike }).connection
-    const dispose = connection.rpc.intercept(
-      '/api',
-      (endpoint) => endpoint === RPC_NAMESPACE || endpoint.startsWith(`${RPC_NAMESPACE}/`),
-      (endpoint, payload, signal) => {
-        const relative = endpoint === RPC_NAMESPACE ? '' : endpoint.slice(RPC_NAMESPACE.length + 1)
-        return handleRpc(relative, payload, signal)
-      },
+    const dispose = connection.rpc.handle(
+      '/devin-cli',
+      (endpoint, payload, signal) => handleRpc(endpoint, payload, signal),
     )
-    return () => { void dispose() }
+    return () => {
+      dispose?.()
+    }
   })
 }
