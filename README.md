@@ -123,18 +123,15 @@ pnpm run mount
 dsh --profile web
 ```
 
-#### 自动化健康检查端点（Agent 验证机制）
+#### 管理通道说明（Agent 验证机制）
 
-插件在后台随 DSH 启动后，会在本地启动一个轻量级的状态与配置管理 Bridge（端口 `4140`）：
+插件不再监听任何本地端口。设置面板的状态查询、模型探测与保存全部通过 DSH 原生 `connection.rpc`（共享 `/api` 通道）完成，自动复用宿主的浏览器认证与 Host/Origin 信任栅栏——只有已登录的 DSH Web 会话可以调用。
 
 ```bash
-# 1. 检查 Bridge 服务健康状态
-curl http://127.0.0.1:4140/api/status
-# 预期返回: {"ok":true,"service":"dsh-devin-cli-bridge","port":4140,"modelsCount":210,...}
-
-# 2. 查询当前已持久化的模型列表
-curl http://127.0.0.1:4140/api/settings
-# 预期返回: {"models":["glm-5-2","swe-1-7",...],"updatedAt":...}
+# Agent 验证方式：确认构建产物存在且插件成功挂载
+pnpm run check
+# 启动后观察 DSH 日志，预期输出:
+# [dsh-devin-cli] Successfully registered Devin LLM adapter
 ```
 
 ---
@@ -167,12 +164,12 @@ curl http://127.0.0.1:4140/api/settings
 │   │ Devin CLI Settings Slot  │  │   /model 切换模型     │  │
 │   └────────────┬─────────────┘  └───────────┬───────────┘  │
 └────────────────┼────────────────────────────┼──────────────┘
-                 │ HTTP (4140 端口 Bridge)     │ DSH RPC
+                 │ DSH 原生 /api RPC（浏览器认证）│ DSH RPC
 ┌────────────────▼────────────────────────────▼──────────────┐
 │                    DSH 插件后端 (Cordis)                   │
 │   ┌──────────────────────────┐  ┌───────────────────────┐  │
-│   │       BridgeServer       │  │     DevinAdapter      │  │
-│   │ (4140 状态/配置存取)     │  │ (LlmAdapter 实现)     │  │
+│   │   DevinRpc (connection)  │  │     DevinAdapter      │  │
+│   │  (原生 RPC 状态/配置)    │  │ (LlmAdapter 实现)     │  │
 │   └────────────┬─────────────┘  └───────────┬───────────┘  │
 └────────────────┼────────────────────────────┼──────────────┘
                  │ 独立持久化                  │ Stdio (JSON-RPC)
@@ -198,9 +195,9 @@ curl http://127.0.0.1:4140/api/settings
 ```text
 dsh-devin-cli/
 ├── src/
-│   ├── index.ts              # Cordis 插件入口，注册 DevinAdapter 与 BridgeServer
+│   ├── index.ts              # Cordis 插件入口，注册 DevinAdapter 与原生 RPC 端点
 │   ├── DevinAdapter.ts       # LlmAdapter 标准实现 (prepareCall, stream, listModels)
-│   ├── bridge.ts             # 4140 本地状态与配置 Bridge 端点
+│   ├── rpc.ts                # DSH 原生 connection.rpc 管理端点（/api 通道）
 │   ├── storage.ts            # 用户设置独立持久化 (~/.dsh/devin-settings.json)
 │   ├── credentials.ts        # 本地 ~/.devin/credentials.toml 凭据解析
 │   ├── client/
@@ -237,8 +234,8 @@ dsh-devin-cli/
 
 ## 🛠️ 常见问题排查 (Troubleshooting)
 
-### Q1: 4140 端口提示冲突？
-> **解答**：Bridge 采用宽松端口绑定。如果 4140 已被其他旧实例占用，请检查任务管理器中是否有旧的 Node 进程并结束它，或者重启 DSH。
+### Q1: 设置面板提示「无法连接 Devin CLI 服务」？
+> **解答**：管理通道走 DSH 原生 `/api` RPC 并复用浏览器登录态。请确认浏览器已正常登录 DSH Web（若 Cookie 过期请重新打开带令牌的入口 URL），并确认插件已随 DSH 启动（日志中出现 `Successfully registered Devin LLM adapter`）。
 
 ### Q2: 提示 `registration.adapter.prepareCall is not a function`？
 > **解答**：最新版 `dsh-llm` 要求必须显式实现 `prepareCall` 方法。本项目在 `DevinAdapter` 中已完备实现，若依然出现此提示，请运行 `pnpm run check` 重新打包。

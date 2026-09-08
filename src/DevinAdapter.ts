@@ -510,6 +510,32 @@ export class DevinAdapter extends LlmAdapter {
       let initialTextBuffer = ''
       let bypassToolBuffering = false
 
+      // 安全收敛所有在途工具卡片（用于正文输出前或流收尾时批量回填完成，彻底防止工具计数异常阻塞正文输出）
+      const settleActiveToolCalls = () => {
+        if (dshSession && typeof dshSession.append === 'function' && activeToolCalls.size > 0) {
+          for (const [toolCallId, active] of activeToolCalls) {
+            try {
+              const message = createToolResultMessage({
+                callId: ToolCallId(toolCallId),
+                content: [{ type: 'text', text: 'Done' }],
+                isError: false,
+              })
+              dshSession.append('tool/result', {
+                turn: currentTurn,
+                step: currentStep,
+                message,
+              }, {
+                surfaceOp: 'append',
+                sourceEventSeqs: active.callSeq ? [active.callSeq] : [],
+              })
+            } catch {
+              // ignore
+            }
+          }
+        }
+        activeToolCalls.clear()
+      }
+
       const flushInitialBuffers = function* (): Generator<StreamChunk, void, unknown> {
         if (bypassToolBuffering) return
         bypassToolBuffering = true
@@ -624,13 +650,19 @@ export class DevinAdapter extends LlmAdapter {
         else if (update.sessionUpdate === 'tool_call_update') {
           const tcu = update as {
             toolCallId?: string
+            callId?: string
+            id?: string
             status?: string
+            isError?: boolean
             content?: Array<{ type?: string; content?: { type?: string; text?: string } }>
           }
-          if (dshSession && typeof dshSession.append === 'function' && tcu.toolCallId) {
-            const active = activeToolCalls.get(tcu.toolCallId)
-            if (active && (tcu.status === 'completed' || tcu.status === 'failed')) {
-              activeToolCalls.delete(tcu.toolCallId)
+          const resolvedToolCallId = tcu.toolCallId || tcu.callId || tcu.id
+          if (dshSession && typeof dshSession.append === 'function' && resolvedToolCallId) {
+            const active = activeToolCalls.get(resolvedToolCallId)
+            const status = (tcu.status || '').toLowerCase()
+            const isFinished = status === 'completed' || status === 'failed' || status === 'success' || status === 'done' || status === 'finished' || status === 'error' || tcu.isError !== undefined
+            if (active && (isFinished || !status)) {
+              activeToolCalls.delete(resolvedToolCallId)
               try {
                 let outputText = ''
                 if (Array.isArray(tcu.content)) {
@@ -638,9 +670,9 @@ export class DevinAdapter extends LlmAdapter {
                     if (item.content?.text) outputText += item.content.text
                   }
                 }
-                const isError = tcu.status === 'failed'
+                const isError = status === 'failed' || status === 'error' || Boolean(tcu.isError)
                 const message = createToolResultMessage({
-                  callId: ToolCallId(tcu.toolCallId),
+                  callId: ToolCallId(resolvedToolCallId),
                   content: [{ type: 'text', text: outputText || (isError ? 'Tool execution failed' : 'Done') }],
                   isError,
                 })
@@ -667,14 +699,15 @@ export class DevinAdapter extends LlmAdapter {
               // 纯对话阶段探测：暂存心声
               initialThoughtBuffer += text
             } else if (hasToolCalls) {
-              // 工具已经发生：仅当所有工具调用完成之后输出的总结性深度思考，才在工具下方正常展现
-              if (activeToolCalls.size === 0) {
-                const { index, startChunk, endChunk } = ensureBlock('reasoning')
-                if (endChunk) yield endChunk
-                if (startChunk) yield startChunk
-                currentBlock!.content += text
-                yield { type: 'reasoning-delta', index, text }
+              // 工具已经发生过：若模型此时输出思考，说明在途工具已执行完毕，自动收敛挂起的工具卡片
+              if (activeToolCalls.size > 0) {
+                settleActiveToolCalls()
               }
+              const { index, startChunk, endChunk } = ensureBlock('reasoning')
+              if (endChunk) yield endChunk
+              if (startChunk) yield startChunk
+              currentBlock!.content += text
+              yield { type: 'reasoning-delta', index, text }
             } else {
               // 确认无工具调用的纯对话
               const { index, startChunk, endChunk } = ensureBlock('reasoning')
@@ -693,19 +726,20 @@ export class DevinAdapter extends LlmAdapter {
             if (content.type === 'text' && content.text) {
               if (!hasToolCalls && !bypassToolBuffering) {
                 initialTextBuffer += content.text
-                // 如果文字积累已长（超过 80 字），说明不是工具前简短过渡短语，而是直接回答
-                if (initialTextBuffer.length > 80) {
+                // 如果文字积累已长（超过 100 字），说明不是工具前简短过渡短语，而是直接回答
+                if (initialTextBuffer.length > 100) {
                   yield* flushInitialBuffers()
                 }
               } else if (hasToolCalls) {
-                // 如果发生过工具调用：仅当在途工具全部完成时，在工具下方流式输出最终结论正文
-                if (activeToolCalls.size === 0) {
-                  const { index, startChunk, endChunk } = ensureBlock('text')
-                  if (endChunk) yield endChunk
-                  if (startChunk) yield startChunk
-                  currentBlock!.content += content.text
-                  yield { type: 'text-delta', index, text: content.text }
+                // 如果发生过工具调用：模型开始输出正文结论时，立即将所有在途工具卡片安全结算（避免后台工具计数异常阻塞正文）
+                if (activeToolCalls.size > 0) {
+                  settleActiveToolCalls()
                 }
+                const { index, startChunk, endChunk } = ensureBlock('text')
+                if (endChunk) yield endChunk
+                if (startChunk) yield startChunk
+                currentBlock!.content += content.text
+                yield { type: 'text-delta', index, text: content.text }
               } else {
                 const { index, startChunk, endChunk } = ensureBlock('text')
                 if (endChunk) yield endChunk
@@ -718,13 +752,17 @@ export class DevinAdapter extends LlmAdapter {
         }
         // 处理 token 用量更新
         else if (update.sessionUpdate === 'usage_update') {
-          const usage = update as AcpUsageUpdate
+          const usage = update as AcpUsageUpdate & { used?: number; totalTokens?: number }
           if (typeof usage.inputTokens === 'number' || typeof usage.outputTokens === 'number') {
+            const inTok = usage.inputTokens ?? 0
+            const outTok = usage.outputTokens ?? 0
+            const totTok = typeof usage.totalTokens === 'number' ? usage.totalTokens : (typeof usage.used === 'number' ? usage.used : inTok + outTok)
             yield {
               type: 'usage',
               usage: {
-                inputTokens: usage.inputTokens ?? 0,
-                outputTokens: usage.outputTokens ?? 0,
+                inputTokens: inTok,
+                outputTokens: outTok,
+                totalTokens: totTok,
               },
             }
           }
@@ -737,28 +775,7 @@ export class DevinAdapter extends LlmAdapter {
       }
 
       // 确保收尾在途尚未接收到完成回执的工具卡片，避免前端卡片一直等待
-      if (dshSession && typeof dshSession.append === 'function' && activeToolCalls.size > 0) {
-        for (const [toolCallId, active] of activeToolCalls) {
-          try {
-            const message = createToolResultMessage({
-              callId: ToolCallId(toolCallId),
-              content: [{ type: 'text', text: 'Done' }],
-              isError: false,
-            })
-            dshSession.append('tool/result', {
-              turn: currentTurn,
-              step: currentStep,
-              message,
-            }, {
-              surfaceOp: 'append',
-              sourceEventSeqs: active.callSeq ? [active.callSeq] : [],
-            })
-          } catch {
-            // ignore
-          }
-        }
-        activeToolCalls.clear()
-      }
+      settleActiveToolCalls()
 
       // 收尾当前尚未关闭的内容块
       const finalEnd = endCurrentBlock()

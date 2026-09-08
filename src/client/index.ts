@@ -12,7 +12,15 @@ const R = ((typeof window !== 'undefined' && (window as any).React) || (typeof r
 const { createElement: h, useState, useEffect } = R
 
 export const name = 'dsh-devin-cli-client'
-export const inject = ['slots']
+export const inject = ['slots', 'connection']
+
+type RpcResultLike =
+  | { ok: true; value: unknown }
+  | { ok: false; error: { code: string; message: string } }
+
+type ConnectionRpc = {
+  call: (channel: string, endpoint: string, payload?: unknown, signal?: AbortSignal) => Promise<RpcResultLike>
+}
 
 export interface ClientContext extends Context {
   slots: {
@@ -22,6 +30,7 @@ export interface ClientContext extends Context {
       Component: (props?: unknown) => unknown,
     ): () => void
   }
+  connection: { rpc: ConnectionRpc }
 }
 
 interface ModelItem {
@@ -47,32 +56,31 @@ interface StatusPayload {
   }
 }
 
-const BRIDGE_API = 'http://127.0.0.1:4140'
-
-async function fetchStatus(): Promise<StatusPayload | null> {
+async function rpcCall<T>(conn: ConnectionRpc, endpoint: string, payload?: unknown): Promise<T> {
+  let result: RpcResultLike
   try {
-    const res = await fetch(`${BRIDGE_API}/api/status`)
-    if (!res.ok) return null
-    return (await res.json()) as StatusPayload
-  } catch {
-    return null
+    result = await conn.call('/api', `devin-cli/${endpoint}`, payload)
+  } catch (err) {
+    throw new Error(`无法连接 Devin CLI 服务: ${err instanceof Error ? err.message : String(err)}`)
   }
+  if (result && result.ok === true) return result.value as T
+  const error = result && result.ok === false ? result.error : undefined
+  throw new Error(error ? `Devin CLI 服务错误 [${error.code}]: ${error.message}` : 'Devin CLI 服务返回了无法识别的响应')
 }
 
-async function fetchModels(): Promise<{ models: ModelItem[]; activeModelIds: string[] } | null> {
-  try {
-    const res = await fetch(`${BRIDGE_API}/api/models`)
-    if (!res.ok) return null
-    return (await res.json()) as { models: ModelItem[]; activeModelIds: string[] }
-  } catch {
-    return null
-  }
+async function fetchStatus(conn: ConnectionRpc): Promise<StatusPayload> {
+  return rpcCall<StatusPayload>(conn, 'status')
+}
+
+async function fetchModels(conn: ConnectionRpc): Promise<{ models: ModelItem[]; activeModelIds: string[] }> {
+  return rpcCall<{ ok: boolean; models: ModelItem[]; activeModelIds: string[] }>(conn, 'models')
 }
 
 export function apply(ctx: ClientContext): void {
   // ─── 左侧设置栏组件 ──────────────────────────────────────────────────────────
 
   const DevinSettingsSection = (): unknown => {
+    const conn = ctx.connection.rpc
     const [status, setStatus] = useState<StatusPayload | null>(null)
     const [models, setModels] = useState<ModelItem[]>([])
     const [activeIds, setActiveIds] = useState<Set<string>>(new Set())
@@ -88,39 +96,42 @@ export function apply(ctx: ClientContext): void {
     }
 
     const loadData = async () => {
-      const st = await fetchStatus()
-      if (st) {
+      try {
+        const st = await fetchStatus(conn)
         setStatus(st)
         if (st.settings?.activeModelIds) {
           setActiveIds(new Set(st.settings.activeModelIds))
         }
-      }
-      const md = await fetchModels()
-      if (md?.models) {
-        setModels(md.models)
-        if (md.activeModelIds) {
-          setActiveIds(new Set(md.activeModelIds))
+        const md = await fetchModels(conn)
+        if (md?.models) {
+          setModels(md.models)
+          if (md.activeModelIds) {
+            setActiveIds(new Set(md.activeModelIds))
+          }
         }
+      } catch (e) {
+        showToast(`Devin CLI 服务连接失败: ${e instanceof Error ? e.message : String(e)}`)
       }
     }
 
     useEffect(() => {
       void loadData()
-      const timer = setInterval(() => void fetchStatus().then((s) => s && setStatus(s)), 5000)
+      const timer = setInterval(() => {
+        void fetchStatus(conn)
+          .then((s) => setStatus(s))
+          .catch(() => {})
+      }, 5000)
       return () => clearInterval(timer)
     }, [])
 
     const handleRefresh = async () => {
       setRefreshing(true)
       try {
-        const res = await fetch(`${BRIDGE_API}/api/refresh`, { method: 'POST' })
-        const json = await res.json()
-        if (json.ok && json.models) {
-          setModels(json.models)
-          showToast(`已重新探测，发现 ${json.models.length} 个可用模型`)
-        }
+        const json = await rpcCall<{ ok: boolean; models: ModelItem[] }>(conn, 'refresh')
+        setModels(json.models)
+        showToast(`已重新探测，发现 ${json.models.length} 个可用模型`)
       } catch (e) {
-        showToast(`探测失败: ${e}`)
+        showToast(`探测失败: ${e instanceof Error ? e.message : String(e)}`)
       } finally {
         setRefreshing(false)
       }
@@ -129,19 +140,12 @@ export function apply(ctx: ClientContext): void {
     const handleSave = async () => {
       setSaving(true)
       try {
-        const res = await fetch(`${BRIDGE_API}/api/settings`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            activeModelIds: [...activeIds],
-          }),
+        await rpcCall<{ ok: boolean }>(conn, 'settings', {
+          activeModelIds: [...activeIds],
         })
-        const json = await res.json()
-        if (json.ok) {
-          showToast(`已成功保存 ${activeIds.size} 个激活模型！`)
-        }
+        showToast(`已成功保存 ${activeIds.size} 个激活模型！`)
       } catch (e) {
-        showToast(`保存失败: ${e}`)
+        showToast(`保存失败: ${e instanceof Error ? e.message : String(e)}`)
       } finally {
         setSaving(false)
       }
@@ -744,7 +748,9 @@ export function apply(ctx: ClientContext): void {
   const DevinHeaderBadge = (): unknown => {
     const [status, setStatus] = useState<StatusPayload | null>(null)
     useEffect(() => {
-      void fetchStatus().then(setStatus)
+      void fetchStatus(ctx.connection.rpc)
+        .then(setStatus)
+        .catch(() => {})
     }, [])
 
     return h(

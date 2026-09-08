@@ -1,42 +1,17 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import {
   resolveRetryPolicy,
   RetryPolicySchema,
   type RetryPolicyConfig,
   type ResolvedRetryPolicy,
-  type LlmModelDiscoveryRequest,
-  type LlmDiscoveredModel,
 } from '@deepseek-ai/dsh-llm'
 import type { SettingsSectionHooks } from '@deepseek-ai/dsh-settings'
 import { DevinAdapter, PROVIDER, type DevinModelConfig } from './DevinAdapter.ts'
 import { readDevinSession } from './credentials.ts'
-import { DevinBridgeServer } from './bridge.ts'
-import { loadSettings, saveSettings } from './storage.ts'
-import { globalDevinRegistry } from './models.ts'
-
-/**
- * 通过本机 devin CLI 执行 `devin models list --format json`
- * 动态获取当前账户可用的所有模型列表，并构建家族与变体映射索引。
- */
-export async function discoverDevinModels(devinBin = 'devin', signal?: AbortSignal) {
-  try {
-    await globalDevinRegistry.init(devinBin, signal)
-    const list = globalDevinRegistry.getBaseModels().map((b) => ({
-      id: b.id,
-      name: b.name,
-      contextWindow: b.contextWindow,
-      maxTokens: b.maxTokens,
-      efforts: b.efforts,
-    }))
-    if (list.length > 0) return list
-  } catch (err) {
-    console.warn('[discoverDevinModels error]:', err)
-  }
-  return []
-}
+import { installDevinRpc } from './rpc.ts'
+import { loadSettings } from './storage.ts'
+import { discoverDevinModels } from './models.ts'
 
 export const name = 'dsh-devin-cli'
 export const inject = ['llm']
@@ -67,8 +42,6 @@ const DEFAULT_MODELS: DevinModelConfig[] = [
 // ─── 配置 schema ────────────────────────────────────────────────────────────
 
 export interface Config {
-  /** 本地 Bridge 服务监听端口，默认 4140。 */
-  bridgePort: number
   /** Devin CLI 可执行文件名称或路径，默认 'devin'。 */
   devinBin: string
   /** ACP session 工作目录。 */
@@ -100,7 +73,6 @@ const catalogModel: z<DevinModelConfig> = z.object({
 })
 
 export const Config: z<Config> = z.object({
-  bridgePort: z.number().step(1).min(1024).max(65535).default(4140),
   devinBin: z.string().default('devin'),
   workspace: z.string().default('.'),
   streamIdleTimeoutMs: z.number().step(1).min(1000).default(300_000),
@@ -118,7 +90,6 @@ export function apply(ctx: Context, config: Config): void {
   const source: () => Config = () => current
 
   let adapterHandle: (() => void) | null = null
-  let bridgeServer: DevinBridgeServer | null = null
 
   const userSettings = loadSettings()
   const devinBin = userSettings.devinBin || config.devinBin || 'devin'
@@ -153,20 +124,12 @@ export function apply(ctx: Context, config: Config): void {
     ctx.logger?.warn?.(`[dsh-devin-cli] Failed to register adapter: ${err}`)
   }
 
-  // 2. 启动本地 Bridge 服务，供 Client 端 UI 获取状态、刷新与切换模型
-  bridgeServer = new DevinBridgeServer({
-    port: config.bridgePort,
+  // 2. 通过 DSH 原生 Connection RPC 暴露管理端点，供 Client 端 UI 获取状态、刷新与切换模型
+  installDevinRpc(ctx, {
     devinBin,
-    workspace,
-    streamIdleTimeoutMs,
-    token,
     onSettingsChanged: () => {
       adapter.clearCache()
     },
-  })
-
-  void bridgeServer.start().catch((err) => {
-    ctx.logger?.warn?.(`[dsh-devin-cli] Failed to start Devin bridge server: ${err}`)
   })
 
   // 3. 安装配置节（支持 Cordis 高级配置）
@@ -188,13 +151,10 @@ export function apply(ctx: Context, config: Config): void {
       try { adapterHandle() } catch { /* ignore */ }
       adapterHandle = null
     }
-    if (bridgeServer) {
-      void bridgeServer.stop()
-      bridgeServer = null
-    }
   })
 }
 
+export { discoverDevinModels } from './models.ts'
 export {
   DevinAdapter,
   PROVIDER,
@@ -202,7 +162,7 @@ export {
   type DevinModelConfig,
   type DevinModelInfo,
 } from './DevinAdapter.ts'
-export { DevinBridgeServer, type DevinBridgeOptions } from './bridge.ts'
 export { readDevinSession, devinCredentialsPath, type DevinSession } from './credentials.ts'
+export { installDevinRpc, type DevinRpcOptions } from './rpc.ts'
 export { AcpStdioClient } from './acp/AcpStdioClient.ts'
 export * from './acp/protocol.ts'

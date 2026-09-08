@@ -297,3 +297,24 @@ export class DevinModelRegistry {
 }
 
 export const globalDevinRegistry = new DevinModelRegistry()
+
+/**
+ * 通过本机 devin CLI 执行 `devin models list --format json`
+ * 动态获取当前账户可用的所有模型列表，并构建家族与变体映射索引。
+ */
+export async function discoverDevinModels(devinBin = 'devin', signal?: AbortSignal) {
+  try {
+    await globalDevinRegistry.init(devinBin, signal)
+    const list = globalDevinRegistry.getBaseModels().map((b) => ({
+      id: b.id,
+      name: b.name,
+      contextWindow: b.contextWindow,
+      maxTokens: b.maxTokens,
+      efforts: b.efforts,
+    }))
+    if (list.length > 0) return list
+  } catch (err) {
+    console.warn('[discoverDevinModels error]:', err)
+  }
+  return []
+}

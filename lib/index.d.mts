@@ -69,35 +69,18 @@ declare class DevinAdapter extends LlmAdapter {
   private handlePermission;
 }
 //#endregion
-//#region src/storage.d.ts
-interface DevinPluginSettings {
-  devinBin: string;
-  workspace: string;
-  streamIdleTimeoutMs: number;
-  activeModelIds: string[];
-}
-//#endregion
-//#region src/bridge.d.ts
-interface DevinBridgeOptions {
-  port?: number;
-  devinBin?: string;
-  workspace?: string;
-  streamIdleTimeoutMs?: number;
-  token?: string;
-  onSettingsChanged?: (settings: DevinPluginSettings) => void;
-}
-declare class DevinBridgeServer {
-  private server;
-  private readonly port;
-  private adapter;
-  private devinBin;
-  private cachedModels;
-  private options;
-  constructor(options?: DevinBridgeOptions);
-  getAdapter(): DevinAdapter;
-  start(): Promise<number>;
-  stop(): Promise<void>;
-}
+//#region src/models.d.ts
+/**
+ * 通过本机 devin CLI 执行 `devin models list --format json`
+ * 动态获取当前账户可用的所有模型列表，并构建家族与变体映射索引。
+ */
+declare function discoverDevinModels(devinBin?: string, signal?: AbortSignal): Promise<{
+  id: string;
+  name: string;
+  contextWindow: number | undefined;
+  maxTokens: number | undefined;
+  efforts: string[];
+}[]>;
 //#endregion
 //#region src/credentials.d.ts
 /**
@@ -120,6 +103,25 @@ interface DevinSession {
 declare function readDevinSession(options?: {
   credentialsPath?: string;
 }): DevinSession | undefined;
+//#endregion
+//#region src/storage.d.ts
+interface DevinPluginSettings {
+  devinBin: string;
+  workspace: string;
+  streamIdleTimeoutMs: number;
+  activeModelIds: string[];
+}
+//#endregion
+//#region src/rpc.d.ts
+interface DevinRpcOptions {
+  devinBin?: string;
+  onSettingsChanged?: (settings: DevinPluginSettings) => void;
+}
+/**
+ * 把设置面板的管理端点注册到 DSH 原生 `/api` RPC 通道：
+ * 复用宿主的浏览器认证与 Host/Origin 信任栅栏，不再监听任何本地端口。
+ */
+declare function installDevinRpc(ctx: Context, options?: DevinRpcOptions): void;
 //#endregion
 //#region src/acp/protocol.d.ts
 declare const ACP_PROTOCOL_VERSION = 1;
@@ -281,22 +283,9 @@ declare class AcpStdioClient {
 }
 //#endregion
 //#region src/index.d.ts
-/**
- * 通过本机 devin CLI 执行 `devin models list --format json`
- * 动态获取当前账户可用的所有模型列表，并构建家族与变体映射索引。
- */
-declare function discoverDevinModels(devinBin?: string, signal?: AbortSignal): Promise<{
-  id: string;
-  name: string;
-  contextWindow: number | undefined;
-  maxTokens: number | undefined;
-  efforts: string[];
-}[]>;
 declare const name = "dsh-devin-cli";
 declare const inject: string[];
 interface Config {
-  /** 本地 Bridge 服务监听端口，默认 4140。 */
-  bridgePort: number;
   /** Devin CLI 可执行文件名称或路径，默认 'devin'。 */
   devinBin: string;
   /** ACP session 工作目录。 */
@@ -320,4 +309,4 @@ interface Config {
 declare const Config: z<Config>;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { ACP_PROTOCOL_VERSION, AcpAgentMessageChunk, AcpAgentStopped, AcpAuthMethod, AcpClientInfo, AcpInitializeParams, AcpInitializeResult, AcpJsonRpcMessage, AcpPermissionOption, AcpPermissionRequestParams, AcpPlanUpdate, AcpPromptContent, AcpPromptParams, AcpPromptResponse, AcpSessionNewParams, AcpSessionNewResult, AcpSessionUpdate, AcpSessionUpdateEnvelope, AcpStateUpdate, AcpStdioClient, AcpToolCall, AcpToolCallUpdate, AcpUnknownUpdate, AcpUsageUpdate, Config, DevinAdapter, type DevinBridgeOptions, DevinBridgeServer, type DevinModelConfig, type DevinModelInfo, type DevinSession, PROVIDER, apply, devinCredentialsPath, discoverDevinModels, inject, mapDevinToolNameToDsh, name, readDevinSession };
+export { ACP_PROTOCOL_VERSION, AcpAgentMessageChunk, AcpAgentStopped, AcpAuthMethod, AcpClientInfo, AcpInitializeParams, AcpInitializeResult, AcpJsonRpcMessage, AcpPermissionOption, AcpPermissionRequestParams, AcpPlanUpdate, AcpPromptContent, AcpPromptParams, AcpPromptResponse, AcpSessionNewParams, AcpSessionNewResult, AcpSessionUpdate, AcpSessionUpdateEnvelope, AcpStateUpdate, AcpStdioClient, AcpToolCall, AcpToolCallUpdate, AcpUnknownUpdate, AcpUsageUpdate, Config, DevinAdapter, type DevinModelConfig, type DevinModelInfo, type DevinRpcOptions, type DevinSession, PROVIDER, apply, devinCredentialsPath, discoverDevinModels, inject, installDevinRpc, mapDevinToolNameToDsh, name, readDevinSession };
