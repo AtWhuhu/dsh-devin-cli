@@ -23,6 +23,8 @@
 - **极简纯粹的本地 stdio ACP**：通过标准 Agent Client Protocol（JSON-RPC 2.0）直接与本地 `devin acp` 通信，无需额外外部代理。
 - **全栈契约完备**：显式实现 `prepareCall(provider, model, signal)`，完美兼容最新版 DSH (`dsh-llm` 0.1.2-rc.1+)。
 - **多模态就绪**：针对 `swe-1-7` 等模型精准声明 `inputModalities: ['text', 'image']`，支持视觉多模态能力。
+- **原生独立工具调用卡片**：将 Devin 底层工具调用（代码搜索、终端执行、文件读写等）原生映射并派发为 DSH 独立的 `tool/call` 与 `tool/result` 卡片消息体，工具执行细节清晰直观，思考流（Reasoning）保持纯净无杂质。
+- **上下文工作区动态对齐**：自动提取会话绑定的工作区目录（Session CWD），确保子进程环境精准对齐当前工程。
 - **独立持久化保障**：用户模型勾选状态安全保存在 `~/.dsh/devin-settings.json`，插件更新升级不丢失配置。
 - **自动化 Agent-Ready**：内置 `pnpm run mount` / `pnpm run unmount` 脚本，便于 AI Agent（如 Claude Code、Cursor、Antigravity、Windsurf）0 门槛自动完成安装与挂载。
 

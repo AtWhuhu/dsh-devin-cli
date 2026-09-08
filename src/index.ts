@@ -133,6 +133,7 @@ export function apply(ctx: Context, config: Config): void {
   const token = config.token || readDevinSession()?.apiKey || ''
 
   const adapter = new DevinAdapter({
+    ctx,
     bin: devinBin,
     cwd: workspace,
     streamIdleTimeoutMs,
@@ -194,7 +195,13 @@ export function apply(ctx: Context, config: Config): void {
   })
 }
 
-export { DevinAdapter, PROVIDER, type DevinModelConfig, type DevinModelInfo } from './DevinAdapter.ts'
+export {
+  DevinAdapter,
+  PROVIDER,
+  mapDevinToolNameToDsh,
+  type DevinModelConfig,
+  type DevinModelInfo,
+} from './DevinAdapter.ts'
 export { DevinBridgeServer, type DevinBridgeOptions } from './bridge.ts'
 export { readDevinSession, devinCredentialsPath, type DevinSession } from './credentials.ts'
 export { AcpStdioClient } from './acp/AcpStdioClient.ts'

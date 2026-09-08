@@ -2,6 +2,8 @@ import {
   LlmAdapter,
   LlmError,
   ReasoningEffortId,
+  ToolCallId,
+  createToolResultMessage,
   type GenerateOptions,
   type LlmModelInfo,
   type LlmProviderInfo,
@@ -38,6 +40,7 @@ export interface DevinModelInfo extends LlmModelInfo {
 }
 
 export interface DevinAdapterConfig {
+  ctx?: any
   bin: string
   cwd: string
   streamIdleTimeoutMs: number
@@ -47,6 +50,103 @@ export interface DevinAdapterConfig {
   token?: string
   retryPolicy?: ResolvedRetryPolicy
   discoverModels?: () => Promise<Array<{ id: string; name: string; contextWindow?: number; maxTokens?: number }>>
+}
+
+/**
+ * 将 Devin 的工具调用归一化映射为 DSH 原生 UI 组件（@deepseek-ai/dsh-client-ui-tool）识别的标准工具名称与参数
+ * 从而在 DSH 聊天界面中渲染为独立原生的工具卡片（Grep · ... / 读取 · ... / Pwsh · ... / 编辑 · ...）
+ */
+export function mapDevinToolNameToDsh(tc: {
+  kind?: string
+  title?: string
+  rawInput?: Record<string, unknown>
+  _meta?: Record<string, unknown>
+}): { name: string; args: Record<string, unknown> } {
+  const kind = (tc.kind || '').toLowerCase()
+  const title = (tc.title || '').toLowerCase()
+  const metaName = String(tc._meta?.['cognition.ai/inferenceToolName'] || '').toLowerCase()
+  const raw = { ...(tc.rawInput || {}) }
+
+  // 1. 命令执行 (pwsh / bash)
+  if (kind === 'exec' || kind === 'bash' || kind === 'pwsh' || metaName === 'exec' || raw.command) {
+    const isWindows = process.platform === 'win32'
+    return {
+      name: isWindows ? 'pwsh' : 'bash',
+      args: {
+        command: raw.command || tc.title || '',
+        description: tc.title || raw.description,
+        ...raw,
+      },
+    }
+  }
+
+  // 2. 读取文件 (read)
+  if (kind === 'read' || metaName === 'read' || title.includes('read')) {
+    return {
+      name: 'read',
+      args: {
+        file_path: raw.file_path || raw.path || '',
+        ...raw,
+      },
+    }
+  }
+
+  // 3. 搜索内容 (grep)
+  if (kind === 'grep' || metaName === 'grep' || title.includes('grep')) {
+    return {
+      name: 'grep',
+      args: {
+        query: raw.query || raw.pattern || '',
+        ...raw,
+      },
+    }
+  }
+
+  // 4. 查找文件 (glob)
+  if (kind === 'glob' || kind === 'find' || metaName === 'glob' || title.includes('find file') || title.includes('glob')) {
+    return {
+      name: 'glob',
+      args: {
+        pattern: raw.pattern || raw.query || '',
+        ...raw,
+      },
+    }
+  }
+
+  // 5. 编辑/修改文件 (edit)
+  if (
+    kind === 'edit' ||
+    kind === 'write' ||
+    metaName === 'edit' ||
+    metaName === 'write' ||
+    title.includes('edit') ||
+    title.includes('write')
+  ) {
+    return {
+      name: 'edit',
+      args: {
+        file_path: raw.file_path || raw.path || '',
+        ...raw,
+      },
+    }
+  }
+
+  // 6. 网络搜索 (web_search)
+  if (kind === 'web_search' || metaName === 'web_search' || title.includes('web search')) {
+    return {
+      name: 'web_search',
+      args: {
+        query: raw.query || '',
+        ...raw,
+      },
+    }
+  }
+
+  // 其他情况保持原样或 fallback 到 generic
+  return {
+    name: metaName || kind || 'generic',
+    args: raw,
+  }
 }
 
 class AsyncQueue<T> {
@@ -85,23 +185,44 @@ function formatMessages(options: GenerateOptions): string {
   if (options.system) {
     parts.push(`[system]\n${options.system}`)
   }
-  for (const message of options.messages) {
+  const messages = Array.isArray(options.messages) ? options.messages : []
+  for (const message of messages) {
+    if (!message) continue
     const role = message.role === 'assistant' ? 'assistant' : message.source?.kind === 'tool' ? 'tool' : 'user'
     parts.push(`[${role}]`)
-    for (const block of message.content) {
+    const blocks = Array.isArray(message.content) ? message.content : []
+    for (const block of blocks) {
+      if (!block || typeof block !== 'object') continue
       if (block.type === 'text') {
-        parts.push(block.text)
+        if (typeof block.text === 'string') parts.push(block.text)
       } else if (block.type === 'reasoning') {
-        parts.push(`[thinking]\n${block.text}`)
+        if (typeof block.text === 'string') parts.push(`[thinking]\n${block.text}`)
       } else if (block.type === 'tool-call') {
-        parts.push(`[tool-call ${block.id}: ${block.name}]\n${block.arguments}`)
+        parts.push(`[tool-call ${block.id || ''}: ${block.name || ''}]\n${block.arguments || ''}`)
       } else if (block.type === 'tool-result') {
         const texts: string[] = []
-        for (const sub of block.content) {
-          if (sub.type === 'text') texts.push(sub.text)
+        if (Array.isArray(block.content)) {
+          for (const sub of block.content) {
+            if (sub && typeof sub === 'object' && sub.type === 'text' && typeof sub.text === 'string') {
+              texts.push(sub.text)
+            } else if (sub) {
+              try {
+                texts.push(JSON.stringify(sub))
+              } catch {
+                // ignore
+              }
+            }
+          }
         }
         const errPrefix = block.isError ? 'ERROR: ' : ''
-        parts.push(`[Tool Result for ${block.toolCallId}]: ${errPrefix}${texts.join('\n')}`)
+        parts.push(`[Tool Result for ${block.toolCallId || ''}]: ${errPrefix}${texts.join('\n')}`)
+      } else {
+        // 其他未知块（如 image 等）安全序列化为文本
+        try {
+          parts.push(JSON.stringify(block))
+        } catch {
+          // ignore
+        }
       }
     }
   }
@@ -246,7 +367,7 @@ export class DevinAdapter extends LlmAdapter {
 
   override async *stream(options: GenerateOptions, signal?: AbortSignal): AsyncIterable<StreamChunk> {
     const queue = new AsyncQueue<AcpSessionUpdate | { done: true; usage?: TokenUsage; cancelled?: boolean }>()
-    let sessionId: string | undefined
+    let acpSessionId: string | undefined
 
     if (globalDevinRegistry.getBaseModels().length === 0) {
       if (this.config.discoverModels) {
@@ -269,6 +390,8 @@ export class DevinAdapter extends LlmAdapter {
     const argv = [this.config.bin, 'acp']
     if (targetModel) argv.push('--model', targetModel)
     const token = this.config.token ?? ''
+
+    console.log(`[dsh-devin-cli] Starting stream for model: ${options.model}, targetModel: ${targetModel}`)
 
     const client = new AcpStdioClient({
       argv,
@@ -299,15 +422,41 @@ export class DevinAdapter extends LlmAdapter {
         }
       }
 
+      // 获取当前 DSH 会话对象（用于发射原生 tool/call 和 tool/result 独立消息体）
+      const dshSessionId = (options as { sessionId?: string }).sessionId
+      let dshSession: any = (options as { session?: any }).session
+      if (!dshSession && dshSessionId && this.config.ctx) {
+        try {
+          const ctxAny = this.config.ctx as any
+          const sessions = typeof ctxAny.get === 'function'
+            ? ctxAny.get('sessions')
+            : (typeof ctxAny.reflect?.get === 'function' ? ctxAny.reflect.get('sessions') : undefined)
+          dshSession = sessions?.get?.(dshSessionId)
+        } catch (err) {
+          console.warn('[dsh-devin-cli] Failed to safely resolve session from ctx:', err)
+          dshSession = undefined
+        }
+      }
+
+      let effectiveCwd = this.config.cwd
+      if (dshSession?.header?.cwd) {
+        effectiveCwd = dshSession.header.cwd
+      } else if ((options as any).cwd) {
+        effectiveCwd = (options as any).cwd
+      }
+
       const sessionParams: AcpSessionNewParams = {
-        cwd: this.config.cwd,
+        cwd: effectiveCwd,
         mcpServers: [],
       }
-      const session = await client.sessionNew(sessionParams, 15_000)
-      sessionId = session.sessionId
+      const acpSession = await client.sessionNew(sessionParams, 15_000)
+      acpSessionId = acpSession.sessionId
+
+      const promptPayload = toAcpPrompt(options)
+      console.log(`[dsh-devin-cli] Prompting Devin ACP (session: ${acpSessionId}, length: ${promptPayload[0]?.text?.length || 0}, cwd: ${effectiveCwd})`)
 
       let promptError: Error | undefined
-      client.prompt(sessionId, toAcpPrompt(options))
+      client.prompt(acpSessionId, promptPayload)
         .then((response) => {
           promptUsage = response.usage
             ? {
@@ -329,6 +478,31 @@ export class DevinAdapter extends LlmAdapter {
 
       let blockIndex = 0
       let currentBlock: { type: 'reasoning' | 'text'; index: number; content: string } | null = null
+
+      let currentTurn = 0
+      let currentStep = 0
+      if (dshSession) {
+        try {
+          const events = dshSession.snapshotEvents ? dshSession.snapshotEvents() : (dshSession.log || [])
+          for (let i = events.length - 1; i >= 0; i--) {
+            const ev = events[i]
+            if (ev.type === 'step/start') {
+              currentStep = ev.data.step
+              currentTurn = ev.data.turn
+              break
+            }
+            if (ev.type === 'turn/start') {
+              currentTurn = ev.data.turn
+              break
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      // 跟踪在途工具调用：toolCallId -> { callSeq, name }
+      const activeToolCalls = new Map<string, { callSeq: number; name: string }>()
 
       const endCurrentBlock = (): StreamChunk | null => {
         if (!currentBlock) return null
@@ -354,7 +528,7 @@ export class DevinAdapter extends LlmAdapter {
 
       while (true) {
         if (signal?.aborted) {
-          if (sessionId) client.cancel(sessionId)
+          if (acpSessionId) client.cancel(acpSessionId)
           throw new LlmError('Devin ACP request aborted', 'ABORTED')
         }
 
@@ -382,7 +556,7 @@ export class DevinAdapter extends LlmAdapter {
           break
         }
 
-        // 处理深度思考流
+        // 处理深度思考流 (纯净思考过程，绝不混入任何工具调用杂质)
         if (update.sessionUpdate === 'agent_thought_chunk') {
           const thought = update as { content?: { type?: string; text?: string } }
           const text = thought.content?.text
@@ -394,39 +568,69 @@ export class DevinAdapter extends LlmAdapter {
             yield { type: 'reasoning-delta', index, text }
           }
         }
-        // 实时可视化工具调用进度（让主人在思考过程框中清楚看到正在使用的工具与命令）
+        // 处理工具调用开始：以 DSH 原生独立事件发射，在前端渲染为独立的工具调用卡片消息体
         else if (update.sessionUpdate === 'tool_call') {
           const tc = update as {
             title?: string
             kind?: string
             toolCallId?: string
             rawInput?: Record<string, unknown>
+            _meta?: Record<string, unknown>
           }
-          const toolName = tc.title || tc.kind || '工具'
-          let argSummary = ''
-          if (tc.rawInput) {
-            if (tc.rawInput.command) argSummary = `: \`${tc.rawInput.command}\``
-            else if (tc.rawInput.file_path) argSummary = `: \`${tc.rawInput.file_path}\``
-            else if (tc.rawInput.path) argSummary = `: \`${tc.rawInput.path}\``
-            else if (tc.rawInput.query) argSummary = `: "${tc.rawInput.query}"`
+          if (dshSession && typeof dshSession.append === 'function') {
+            try {
+              const mapped = mapDevinToolNameToDsh(tc)
+              const toolCallId = tc.toolCallId || `devin_call_${Date.now()}`
+              const appendResult = dshSession.append('tool/call', {
+                turn: currentTurn,
+                step: currentStep,
+                callId: toolCallId,
+                name: mapped.name,
+                arguments: JSON.stringify(mapped.args),
+              })
+              const callSeq = appendResult?.seq ?? Date.now()
+              activeToolCalls.set(toolCallId, { callSeq, name: mapped.name })
+            } catch (err) {
+              console.warn('[dsh-devin-cli] Failed to append tool/call to session:', err)
+            }
           }
-          const text = `\n\n🔧 **[执行工具]** ${toolName}${argSummary}...\n`
-          const { index, startChunk, endChunk } = ensureBlock('reasoning')
-          if (endChunk) yield endChunk
-          if (startChunk) yield startChunk
-          currentBlock!.content += text
-          yield { type: 'reasoning-delta', index, text }
         }
-        // 工具调用完成状态
+        // 处理工具调用完成/失败状态：更新对应的独立工具卡片为完成并回填输出结果
         else if (update.sessionUpdate === 'tool_call_update') {
-          const tcu = update as { status?: string; toolCallId?: string }
-          if (tcu.status === 'completed') {
-            const text = `✓ *[工具调用完成]*\n`
-            const { index, startChunk, endChunk } = ensureBlock('reasoning')
-            if (endChunk) yield endChunk
-            if (startChunk) yield startChunk
-            currentBlock!.content += text
-            yield { type: 'reasoning-delta', index, text }
+          const tcu = update as {
+            toolCallId?: string
+            status?: string
+            content?: Array<{ type?: string; content?: { type?: string; text?: string } }>
+          }
+          if (dshSession && typeof dshSession.append === 'function' && tcu.toolCallId) {
+            const active = activeToolCalls.get(tcu.toolCallId)
+            if (active && (tcu.status === 'completed' || tcu.status === 'failed')) {
+              activeToolCalls.delete(tcu.toolCallId)
+              try {
+                let outputText = ''
+                if (Array.isArray(tcu.content)) {
+                  for (const item of tcu.content) {
+                    if (item.content?.text) outputText += item.content.text
+                  }
+                }
+                const isError = tcu.status === 'failed'
+                const message = createToolResultMessage({
+                  callId: ToolCallId(tcu.toolCallId),
+                  content: [{ type: 'text', text: outputText || (isError ? 'Tool execution failed' : 'Done') }],
+                  isError,
+                })
+                dshSession.append('tool/result', {
+                  turn: currentTurn,
+                  step: currentStep,
+                  message,
+                }, {
+                  surfaceOp: 'append',
+                  sourceEventSeqs: active.callSeq ? [active.callSeq] : [],
+                })
+              } catch (err) {
+                console.warn('[dsh-devin-cli] Failed to append tool/result to session:', err)
+              }
+            }
           }
         }
         // 处理正文回复流
@@ -458,6 +662,30 @@ export class DevinAdapter extends LlmAdapter {
         }
       }
 
+      // 确保收尾在途尚未接收到完成回执的工具卡片，避免前端卡片一直等待
+      if (dshSession && typeof dshSession.append === 'function' && activeToolCalls.size > 0) {
+        for (const [toolCallId, active] of activeToolCalls) {
+          try {
+            const message = createToolResultMessage({
+              callId: ToolCallId(toolCallId),
+              content: [{ type: 'text', text: 'Done' }],
+              isError: false,
+            })
+            dshSession.append('tool/result', {
+              turn: currentTurn,
+              step: currentStep,
+              message,
+            }, {
+              surfaceOp: 'append',
+              sourceEventSeqs: active.callSeq ? [active.callSeq] : [],
+            })
+          } catch {
+            // ignore
+          }
+        }
+        activeToolCalls.clear()
+      }
+
       // 收尾当前尚未关闭的内容块
       const finalEnd = endCurrentBlock()
       if (finalEnd) yield finalEnd
@@ -468,8 +696,10 @@ export class DevinAdapter extends LlmAdapter {
       yield { type: 'finish', reason: { kind: 'stop' } }
     } catch (error) {
       if (error instanceof LlmError) throw error
+      const msg = error instanceof Error ? (error.stack || error.message) : String(error)
       const tail = client.getStderrTail().trim() || 'none'
-      throw new LlmError(`Devin ACP stream failed (stderr tail: ${tail})`, 'TRANSPORT', { cause: error as Error })
+      console.error('[dsh-devin-cli] Stream exception:', error)
+      throw new LlmError(`Devin ACP stream failed: ${msg} (stderr tail: ${tail})`, 'TRANSPORT', { cause: error as Error })
     } finally {
       client.close()
     }

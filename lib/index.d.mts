@@ -16,6 +16,7 @@ interface DevinModelInfo extends LlmModelInfo {
   maxTokens?: number;
 }
 interface DevinAdapterConfig {
+  ctx?: any;
   bin: string;
   cwd: string;
   streamIdleTimeoutMs: number;
@@ -31,6 +32,19 @@ interface DevinAdapterConfig {
     maxTokens?: number;
   }>>;
 }
+/**
+ * 将 Devin 的工具调用归一化映射为 DSH 原生 UI 组件（@deepseek-ai/dsh-client-ui-tool）识别的标准工具名称与参数
+ * 从而在 DSH 聊天界面中渲染为独立原生的工具卡片（Grep · ... / 读取 · ... / Pwsh · ... / 编辑 · ...）
+ */
+declare function mapDevinToolNameToDsh(tc: {
+  kind?: string;
+  title?: string;
+  rawInput?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
+}): {
+  name: string;
+  args: Record<string, unknown>;
+};
 /**
  * Devin CLI 专有 DSH LlmAdapter。
  * 直接通过 stdio 交互调用本机的 `devin acp` 服务，零多余协议代理。
@@ -306,4 +320,4 @@ interface Config {
 declare const Config: z<Config>;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { ACP_PROTOCOL_VERSION, AcpAgentMessageChunk, AcpAgentStopped, AcpAuthMethod, AcpClientInfo, AcpInitializeParams, AcpInitializeResult, AcpJsonRpcMessage, AcpPermissionOption, AcpPermissionRequestParams, AcpPlanUpdate, AcpPromptContent, AcpPromptParams, AcpPromptResponse, AcpSessionNewParams, AcpSessionNewResult, AcpSessionUpdate, AcpSessionUpdateEnvelope, AcpStateUpdate, AcpStdioClient, AcpToolCall, AcpToolCallUpdate, AcpUnknownUpdate, AcpUsageUpdate, Config, DevinAdapter, type DevinBridgeOptions, DevinBridgeServer, type DevinModelConfig, type DevinModelInfo, type DevinSession, PROVIDER, apply, devinCredentialsPath, discoverDevinModels, inject, name, readDevinSession };
+export { ACP_PROTOCOL_VERSION, AcpAgentMessageChunk, AcpAgentStopped, AcpAuthMethod, AcpClientInfo, AcpInitializeParams, AcpInitializeResult, AcpJsonRpcMessage, AcpPermissionOption, AcpPermissionRequestParams, AcpPlanUpdate, AcpPromptContent, AcpPromptParams, AcpPromptResponse, AcpSessionNewParams, AcpSessionNewResult, AcpSessionUpdate, AcpSessionUpdateEnvelope, AcpStateUpdate, AcpStdioClient, AcpToolCall, AcpToolCallUpdate, AcpUnknownUpdate, AcpUsageUpdate, Config, DevinAdapter, type DevinBridgeOptions, DevinBridgeServer, type DevinModelConfig, type DevinModelInfo, type DevinSession, PROVIDER, apply, devinCredentialsPath, discoverDevinModels, inject, mapDevinToolNameToDsh, name, readDevinSession };
