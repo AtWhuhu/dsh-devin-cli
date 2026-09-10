@@ -67,84 +67,161 @@ export function mapDevinToolNameToDsh(tc: {
   const metaName = String(tc._meta?.['cognition.ai/inferenceToolName'] || '').toLowerCase()
   const raw = { ...(tc.rawInput || {}) }
 
+  // 综合匹配串（覆盖 kind、title、metaName）
+  const combined = `${kind} ${title} ${metaName}`
+
   // 1. 命令执行 (pwsh / bash)
-  if (kind === 'exec' || kind === 'bash' || kind === 'pwsh' || metaName === 'exec' || raw.command) {
+  if (
+    kind === 'exec' ||
+    kind === 'bash' ||
+    kind === 'pwsh' ||
+    metaName === 'exec' ||
+    metaName === 'bash' ||
+    metaName === 'pwsh' ||
+    raw.command ||
+    raw.cmd
+  ) {
     const isWindows = process.platform === 'win32'
+    const cmdStr = String(raw.command || raw.cmd || tc.title || '')
+    // 如果 title 是常见的无用通用描述（如 "Ran command"），优先使用具体命令作为 description 摘要
+    const isGenericTitle = !tc.title || title === 'ran command' || title === 'run command' || title.startsWith('exec')
+    const description = isGenericTitle ? cmdStr : (tc.title || cmdStr)
     return {
       name: isWindows ? 'pwsh' : 'bash',
       args: {
-        command: raw.command || tc.title || '',
-        description: tc.title || raw.description,
+        command: cmdStr,
+        description,
         ...raw,
       },
     }
   }
 
-  // 2. 读取文件 (read)
-  if (kind === 'read' || metaName === 'read' || title.includes('read')) {
+  // 2. 读取文件 (read) - 支持 functions.read:*, read_file, file_read, read_symbol 等
+  if (
+    kind === 'read' ||
+    metaName === 'read' ||
+    combined.includes('read') ||
+    combined.includes('functions.read') ||
+    metaName.startsWith('functions.read')
+  ) {
+    const filePath = String(raw.file_path || raw.path || raw.filePath || raw.file || '')
     return {
       name: 'read',
       args: {
-        file_path: raw.file_path || raw.path || '',
+        file_path: filePath,
+        path: filePath,
         ...raw,
       },
     }
   }
 
-  // 3. 搜索内容 (grep)
-  if (kind === 'grep' || metaName === 'grep' || title.includes('grep')) {
+  // 3. 搜索内容 (grep) - 支持 functions.grep:*, grep_search, ripgrep 等
+  if (
+    kind === 'grep' ||
+    metaName === 'grep' ||
+    combined.includes('grep') ||
+    combined.includes('functions.grep') ||
+    metaName.startsWith('functions.grep')
+  ) {
+    const query = String(raw.query || raw.pattern || raw.search_term || raw.regex || tc.title || '')
+    const path = raw.path || raw.dir || raw.directory || raw.file_path
     return {
       name: 'grep',
       args: {
-        query: raw.query || raw.pattern || '',
+        pattern: query,
+        query,
+        ...(path ? { path: String(path) } : {}),
         ...raw,
       },
     }
   }
 
-  // 4. 查找文件 (glob)
-  if (kind === 'glob' || kind === 'find' || metaName === 'glob' || title.includes('find file') || title.includes('glob')) {
+  // 4. 查找文件 (glob) - 支持 functions.glob, find_by_name 等
+  if (
+    kind === 'glob' ||
+    kind === 'find' ||
+    metaName === 'glob' ||
+    metaName === 'find' ||
+    combined.includes('glob') ||
+    combined.includes('find file') ||
+    combined.includes('find_by_name')
+  ) {
+    const pattern = String(raw.pattern || raw.query || raw.glob || '')
+    const path = raw.path || raw.dir || raw.directory
     return {
       name: 'glob',
       args: {
-        pattern: raw.pattern || raw.query || '',
+        pattern,
+        query: pattern,
+        ...(path ? { path: String(path) } : {}),
         ...raw,
       },
     }
   }
 
-  // 5. 编辑/修改文件 (edit)
+  // 5. 编辑/修改文件 (edit / write) - 支持 functions.write:*, functions.edit:*, replace 等
   if (
     kind === 'edit' ||
     kind === 'write' ||
     metaName === 'edit' ||
     metaName === 'write' ||
-    title.includes('edit') ||
-    title.includes('write')
+    combined.includes('edit') ||
+    combined.includes('write') ||
+    metaName.startsWith('functions.write') ||
+    metaName.startsWith('functions.edit')
   ) {
+    const filePath = String(raw.file_path || raw.path || raw.filePath || raw.file || '')
     return {
       name: 'edit',
       args: {
-        file_path: raw.file_path || raw.path || '',
+        file_path: filePath,
+        path: filePath,
         ...raw,
       },
     }
   }
 
-  // 6. 网络搜索 (web_search)
-  if (kind === 'web_search' || metaName === 'web_search' || title.includes('web search')) {
+  // 6. 网络搜索与拉取 (web_search / web_fetch)
+  if (kind === 'web_search' || metaName === 'web_search' || combined.includes('web search') || combined.includes('web_search')) {
+    const query = String(raw.query || raw.pattern || '')
     return {
       name: 'web_search',
       args: {
-        query: raw.query || '',
+        query,
+        pattern: query,
+        ...raw,
+      },
+    }
+  }
+  if (kind === 'web_fetch' || metaName === 'web_fetch' || combined.includes('web fetch') || combined.includes('web_fetch')) {
+    const url = String(raw.url || raw.link || '')
+    return {
+      name: 'web_fetch',
+      args: {
+        url,
         ...raw,
       },
     }
   }
 
-  // 其他情况保持原样或 fallback 到 generic
+  // 7. 子代理/代理委派 (subagent)
+  if (combined.includes('subagent')) {
+    const desc = String(raw.description || raw.prompt || raw.task || raw.instruction || tc.title || '')
+    return {
+      name: 'subagent',
+      args: {
+        description: desc,
+        prompt: desc,
+        ...raw,
+      },
+    }
+  }
+
+  // 8. 其他情况：清洗工具名（去掉 functions. 和 :数字 后缀），让显示更加干净专业
+  let cleanName = metaName || kind || 'generic'
+  cleanName = cleanName.replace(/^functions\./i, '').replace(/:\d+$/, '')
   return {
-    name: metaName || kind || 'generic',
+    name: cleanName || 'generic',
     args: raw,
   }
 }
@@ -508,9 +585,11 @@ export class DevinAdapter extends LlmAdapter {
       let hasToolCalls = false
       let initialThoughtBuffer = ''
       let initialTextBuffer = ''
-      let bypassToolBuffering = false
+      let postToolThoughtBuffer = ''
+      let postToolTextBuffer = ''
+      let isPureChat = false
 
-      // 安全收敛所有在途工具卡片（用于正文输出前或流收尾时批量回填完成，彻底防止工具计数异常阻塞正文输出）
+      // 安全收敛所有在途工具卡片（用于流收尾或最终结算）
       const settleActiveToolCalls = () => {
         if (dshSession && typeof dshSession.append === 'function' && activeToolCalls.size > 0) {
           for (const [toolCallId, active] of activeToolCalls) {
@@ -536,9 +615,10 @@ export class DevinAdapter extends LlmAdapter {
         activeToolCalls.clear()
       }
 
+      // 纯对话阶段：将初始缓冲内容作为流式 delta 发射
       const flushInitialBuffers = function* (): Generator<StreamChunk, void, unknown> {
-        if (bypassToolBuffering) return
-        bypassToolBuffering = true
+        if (isPureChat) return
+        isPureChat = true
         if (initialThoughtBuffer) {
           const { index, startChunk, endChunk } = ensureBlock('reasoning')
           if (endChunk) yield endChunk
@@ -612,10 +692,10 @@ export class DevinAdapter extends LlmAdapter {
         // 处理工具调用开始：以 DSH 原生独立事件发射，在前端渲染为独立的工具调用卡片消息体
         if (update.sessionUpdate === 'tool_call') {
           hasToolCalls = true
-          // 既然触发了工具调用，丢弃工具前暂存的零碎过渡短语或心声，防止在工具前建立过早的时间锚点导致工具卡片沉底
+          isPureChat = false
+          // 既然触发了工具调用，彻底清空工具前暂存的零碎过渡短语或心声，防止在工具前建立过早的时间锚点导致工具卡片沉底
           initialThoughtBuffer = ''
           initialTextBuffer = ''
-          bypassToolBuffering = true
 
           // 如果之前有尚未关闭的块，关闭它
           const endChunk = endCurrentBlock()
@@ -695,26 +775,19 @@ export class DevinAdapter extends LlmAdapter {
           const thought = update as { content?: { type?: string; text?: string } }
           const text = thought.content?.text
           if (text) {
-            if (!hasToolCalls && !bypassToolBuffering) {
-              // 纯对话阶段探测：暂存心声
-              initialThoughtBuffer += text
-            } else if (hasToolCalls) {
-              // 工具已经发生过：若模型此时输出思考，说明在途工具已执行完毕，自动收敛挂起的工具卡片
-              if (activeToolCalls.size > 0) {
-                settleActiveToolCalls()
-              }
+            if (hasToolCalls) {
+              // 发生过工具调用：严格缓冲思考，绝不提前 yield，杜绝破坏工具调用的前置时序
+              postToolThoughtBuffer += text
+            } else if (isPureChat) {
+              // 纯对话直通模式：实时流式输出
               const { index, startChunk, endChunk } = ensureBlock('reasoning')
               if (endChunk) yield endChunk
               if (startChunk) yield startChunk
               currentBlock!.content += text
               yield { type: 'reasoning-delta', index, text }
             } else {
-              // 确认无工具调用的纯对话
-              const { index, startChunk, endChunk } = ensureBlock('reasoning')
-              if (endChunk) yield endChunk
-              if (startChunk) yield startChunk
-              currentBlock!.content += text
-              yield { type: 'reasoning-delta', index, text }
+              // 尚未发生工具调用的探测期：暂存思考
+              initialThoughtBuffer += text
             }
           }
         }
@@ -724,28 +797,23 @@ export class DevinAdapter extends LlmAdapter {
           const contents = Array.isArray(chunk.content) ? chunk.content : [chunk.content]
           for (const content of contents) {
             if (content.type === 'text' && content.text) {
-              if (!hasToolCalls && !bypassToolBuffering) {
-                initialTextBuffer += content.text
-                // 如果文字积累已长（超过 100 字），说明不是工具前简短过渡短语，而是直接回答
-                if (initialTextBuffer.length > 100) {
-                  yield* flushInitialBuffers()
-                }
-              } else if (hasToolCalls) {
-                // 如果发生过工具调用：模型开始输出正文结论时，立即将所有在途工具卡片安全结算（避免后台工具计数异常阻塞正文）
-                if (activeToolCalls.size > 0) {
-                  settleActiveToolCalls()
-                }
+              if (hasToolCalls) {
+                // 发生过工具调用：严格缓冲正文结论，绝不在工具完成前提前 yield！
+                postToolTextBuffer += content.text
+              } else if (isPureChat) {
+                // 纯对话直通模式：实时流式打字输出
                 const { index, startChunk, endChunk } = ensureBlock('text')
                 if (endChunk) yield endChunk
                 if (startChunk) yield startChunk
                 currentBlock!.content += content.text
                 yield { type: 'text-delta', index, text: content.text }
               } else {
-                const { index, startChunk, endChunk } = ensureBlock('text')
-                if (endChunk) yield endChunk
-                if (startChunk) yield startChunk
-                currentBlock!.content += content.text
-                yield { type: 'text-delta', index, text: content.text }
+                // 探测期：暂存文本
+                initialTextBuffer += content.text
+                // 仅当文字累积较多（超过 120 字）且从来没有工具调用时，判定为纯对话问答，开启直通流
+                if (initialTextBuffer.length > 120) {
+                  yield* flushInitialBuffers()
+                }
               }
             }
           }
@@ -769,13 +837,32 @@ export class DevinAdapter extends LlmAdapter {
         }
       }
 
-      // 纯对话场景下若缓冲区仍有残留内容，在流收尾前输出
-      if (!hasToolCalls && !bypassToolBuffering) {
+      if (hasToolCalls) {
+        // 1. 确保结算所有在途工具卡片，写入对应的 tool/result（保证工具全部固化在 session 中）
+        settleActiveToolCalls()
+
+        // 2. 在所有工具卡片已固化在 session 之后，开始在工具下方发射最终的思考与正文：
+        if (postToolThoughtBuffer) {
+          const { index, startChunk, endChunk } = ensureBlock('reasoning')
+          if (endChunk) yield endChunk
+          if (startChunk) yield startChunk
+          currentBlock!.content += postToolThoughtBuffer
+          yield { type: 'reasoning-delta', index, text: postToolThoughtBuffer }
+          const closeThought = endCurrentBlock()
+          if (closeThought) yield closeThought
+        }
+
+        if (postToolTextBuffer) {
+          const { index, startChunk, endChunk } = ensureBlock('text')
+          if (endChunk) yield endChunk
+          if (startChunk) yield startChunk
+          currentBlock!.content += postToolTextBuffer
+          yield { type: 'text-delta', index, text: postToolTextBuffer }
+        }
+      } else {
+        // 纯对话模式收尾：若缓冲区仍有残留内容（如短问答），在流收尾前完整输出
         yield* flushInitialBuffers()
       }
-
-      // 确保收尾在途尚未接收到完成回执的工具卡片，避免前端卡片一直等待
-      settleActiveToolCalls()
 
       // 收尾当前尚未关闭的内容块
       const finalEnd = endCurrentBlock()
