@@ -159,6 +159,7 @@ export {
   DevinAdapter,
   PROVIDER,
   mapDevinToolNameToDsh,
+  healDshUiFences,
   type DevinModelConfig,
   type DevinModelInfo,
 } from './DevinAdapter.ts'

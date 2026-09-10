@@ -46,6 +46,18 @@ declare function mapDevinToolNameToDsh(tc: {
   args: Record<string, unknown>;
 };
 /**
+ * 智能自愈与规范化文本中的 \`\`\`dsh-ui 围栏 JSON 数据：
+ * 1. text: 修正 size 常见别名（sm/small -> muted, xs/mini -> caption, md/normal -> body, lg/large -> h3, xl -> h2），删除非法 size 及未声明的 color 属性，自动补充换行；
+ * 2. callout: 将 kind 映射为 tone，修正 warn -> warning, danger/alert -> error，自动补充 content 换行；
+ * 3. accordion: 兼容简写 item.content，自愈为规范的子 text 节点；
+ * 4. steps: 将 items 映射为 steps；
+ * 5. badge: 修正 warning -> warn, error -> danger；
+ * 6. card: 将 label 映射为 title；
+ * 7. button: 修正 default/secondary -> ghost；
+ * 避免因常见大模型习惯性字段差异导致 GenUI 严格校验阻断而退化为普通代码框。
+ */
+declare function healDshUiFences(fullText: string): string;
+/**
  * Devin CLI 专有 DSH LlmAdapter。
  * 直接通过 stdio 交互调用本机的 `devin acp` 服务，零多余协议代理。
  */
@@ -309,4 +321,4 @@ interface Config {
 declare const Config: z<Config>;
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { ACP_PROTOCOL_VERSION, AcpAgentMessageChunk, AcpAgentStopped, AcpAuthMethod, AcpClientInfo, AcpInitializeParams, AcpInitializeResult, AcpJsonRpcMessage, AcpPermissionOption, AcpPermissionRequestParams, AcpPlanUpdate, AcpPromptContent, AcpPromptParams, AcpPromptResponse, AcpSessionNewParams, AcpSessionNewResult, AcpSessionUpdate, AcpSessionUpdateEnvelope, AcpStateUpdate, AcpStdioClient, AcpToolCall, AcpToolCallUpdate, AcpUnknownUpdate, AcpUsageUpdate, Config, DevinAdapter, type DevinModelConfig, type DevinModelInfo, type DevinRpcOptions, type DevinSession, PROVIDER, apply, devinCredentialsPath, discoverDevinModels, inject, installDevinRpc, mapDevinToolNameToDsh, name, readDevinSession };
+export { ACP_PROTOCOL_VERSION, AcpAgentMessageChunk, AcpAgentStopped, AcpAuthMethod, AcpClientInfo, AcpInitializeParams, AcpInitializeResult, AcpJsonRpcMessage, AcpPermissionOption, AcpPermissionRequestParams, AcpPlanUpdate, AcpPromptContent, AcpPromptParams, AcpPromptResponse, AcpSessionNewParams, AcpSessionNewResult, AcpSessionUpdate, AcpSessionUpdateEnvelope, AcpStateUpdate, AcpStdioClient, AcpToolCall, AcpToolCallUpdate, AcpUnknownUpdate, AcpUsageUpdate, Config, DevinAdapter, type DevinModelConfig, type DevinModelInfo, type DevinRpcOptions, type DevinSession, PROVIDER, apply, devinCredentialsPath, discoverDevinModels, healDshUiFences, inject, installDevinRpc, mapDevinToolNameToDsh, name, readDevinSession };

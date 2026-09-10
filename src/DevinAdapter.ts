@@ -2,8 +2,6 @@ import {
   LlmAdapter,
   LlmError,
   ReasoningEffortId,
-  ToolCallId,
-  createToolResultMessage,
   type GenerateOptions,
   type LlmModelInfo,
   type LlmProviderInfo,
@@ -257,11 +255,193 @@ class AsyncQueue<T> {
   }
 }
 
+const DSH_UI_SPEC_RULE = `
+[dsh-ui 交互式组件规范与视觉设计原则]
+当在回复中使用 \`\`\`dsh-ui 围栏输出界面时，必须严格遵守白名单属性与合法枚举，严禁输出未声明属性或 CSS 缩写，否则界面无法渲染：
+1. text: {"type":"text","content":"正文","size":"h1|h2|h3|body|muted|caption","center":boolean}
+   - ⚠️ size 仅支持以上 6 个枚举，严禁使用 "sm"、"small"、"lg" 等；灰色文字请使用 "muted"；禁止添加 "color" 属性。
+2. callout（提示横幅）: {"type":"callout","tone":"info|success|warning|error","title":"标题","content":"正文"}
+   - ⚠️ 警告类型必须是 "warning"（不能写 "warn"），错误类型为 "error"（不能写 "danger"）。
+   - ⚠️ 视觉红线：严禁连续堆放 3 个以上大色块 callout！callout 仅用于 1~2 个关键总结或高危警示；多段文字必须在 content 中使用 \\n\\n 明确分行。
+3. accordion（手风琴折叠面板）: {"type":"accordion","items":[{"title":"问题标题","items":[{"type":"text","content":"详细分析与建议"}]}]}
+   - 💡 强烈推荐：多项缺陷清单、分级排查条目、QA 问答首选 accordion，结构紧凑高质感，展开即看详情。
+4. list: {"type":"list","items":[{"title":"主标题","desc":"说明"}]}
+5. steps: {"type":"steps","current":0,"steps":[{"title":"步骤1","desc":"说明"}]}
+   - ⚠️ 步骤数组属性名为 "steps"（每项含 title 与 desc）。
+6. card: {"type":"card","title":"卡片标题","items":[...]}
+7. table: {"type":"table","columns":["列1","列2"],"rows":[["值1","值2"]]}
+8. badge: {"type":"badge","label":"标签","tone":"success|warn|danger|accent"}
+9. stat: {"type":"stat","label":"标题","value":"数值","delta":"环比?"}
+10. button: {"type":"button","label":"按钮","tone":"primary|danger|success|ghost","action":"actionName"}
+排版要求：所有多段落文字（包含危害、建议、原因等）必须在 content 中使用 \\n\\n 明确换行分段，禁止挤成一坨；所有围栏必须是合法合规的单个 JSON 对象，禁止尾随逗号。`
+
+/**
+ * 格式化多行文本，在常见中文分段标记前自动补充 \\n\\n，
+ * 避免模型输出长文本时挤成一坨难以阅读。
+ */
+function formatContentBreaks(text: string): string {
+  if (!text || typeof text !== 'string') return text
+  return text
+    .replace(/([^\r\n])\s*(危害[：:]|【危害】)/g, '$1\n\n危害：')
+    .replace(/([^\r\n])\s*(修复建议[：:]|【修复建议】|建议[：:]|【建议】)/g, '$1\n\n修复建议：')
+    .replace(/([^\r\n])\s*(影响(?:范围)?[：:]|【影响】)/g, '$1\n\n影响：')
+    .replace(/([^\r\n])\s*(原因[：:]|【原因】)/g, '$1\n\n原因：')
+    .replace(/([^\r\n])\s*([0-9]+[、.][\u4e00-\u9fa5a-zA-Z])/g, '$1\n$2')
+}
+
+/**
+ * 智能自愈与规范化文本中的 \`\`\`dsh-ui 围栏 JSON 数据：
+ * 1. text: 修正 size 常见别名（sm/small -> muted, xs/mini -> caption, md/normal -> body, lg/large -> h3, xl -> h2），删除非法 size 及未声明的 color 属性，自动补充换行；
+ * 2. callout: 将 kind 映射为 tone，修正 warn -> warning, danger/alert -> error，自动补充 content 换行；
+ * 3. accordion: 兼容简写 item.content，自愈为规范的子 text 节点；
+ * 4. steps: 将 items 映射为 steps；
+ * 5. badge: 修正 warning -> warn, error -> danger；
+ * 6. card: 将 label 映射为 title；
+ * 7. button: 修正 default/secondary -> ghost；
+ * 避免因常见大模型习惯性字段差异导致 GenUI 严格校验阻断而退化为普通代码框。
+ */
+export function healDshUiFences(fullText: string): string {
+  if (!fullText || !fullText.includes('dsh-ui')) return fullText
+
+  const fenceRegex = /(```dsh-ui[^\r\n]*\r?\n)([\s\S]*?)(\r?\n```)/g
+
+  return fullText.replace(fenceRegex, (match, prefix, body, suffix) => {
+    try {
+      const parsed = JSON.parse(body.trim())
+      const healed = healGenuiNode(parsed)
+      return `${prefix}${JSON.stringify(healed)}${suffix}`
+    } catch {
+      return match
+    }
+  })
+}
+
+function formatArgsSummary(args: Record<string, unknown> | undefined): string {
+  if (!args || typeof args !== 'object') return ''
+  if (typeof args.file_path === 'string') return args.file_path
+  if (typeof args.path === 'string') return args.path
+  if (typeof args.command === 'string') return args.command.length > 80 ? `${args.command.slice(0, 80)}...` : args.command
+  if (typeof args.query === 'string') return args.query
+  if (typeof args.pattern === 'string') return args.pattern
+  try {
+    const str = JSON.stringify(args)
+    return str.length > 80 ? `${str.slice(0, 80)}...` : str
+  } catch {
+    return ''
+  }
+}
+
+function formatOutputSummary(text: string): string {
+  if (!text) return ''
+  const trimmed = text.trim()
+  if (!trimmed) return ''
+  const firstLine = trimmed.split('\n')[0]
+  if (firstLine.length > 80) return `${firstLine.slice(0, 80)}...`
+  return firstLine
+}
+
+function healGenuiNode(node: any): any {
+  if (!node || typeof node !== 'object') return node
+
+  const validTextSizes = new Set(['h1', 'h2', 'h3', 'body', 'muted', 'caption'])
+
+  if (node.type === 'text') {
+    if (typeof node.size === 'string') {
+      const s = node.size.toLowerCase().trim()
+      if (s === 'sm' || s === 'small') node.size = 'muted'
+      else if (s === 'xs' || s === 'mini') node.size = 'caption'
+      else if (s === 'md' || s === 'medium' || s === 'normal') node.size = 'body'
+      else if (s === 'lg' || s === 'large') node.size = 'h3'
+      else if (s === 'xl') node.size = 'h2'
+      else if (!validTextSizes.has(s)) delete node.size
+    }
+    if ('color' in node && typeof node.color === 'string') {
+      delete node.color
+    }
+    if (typeof node.content === 'string') {
+      node.content = formatContentBreaks(node.content)
+    }
+  } else if (node.type === 'callout') {
+    if (node.kind && !node.tone) {
+      node.tone = node.kind
+      delete node.kind
+    }
+    if (typeof node.tone === 'string') {
+      const t = node.tone.toLowerCase().trim()
+      if (t === 'warn') node.tone = 'warning'
+      else if (t === 'danger' || t === 'alert') node.tone = 'error'
+    }
+    if (typeof node.content === 'string') {
+      node.content = formatContentBreaks(node.content)
+    }
+  } else if (node.type === 'accordion') {
+    if (Array.isArray(node.items)) {
+      node.items = node.items.map((item: any) => {
+        if (!item || typeof item !== 'object') return item
+        // 兼容简写：{ title: "...", content: "..." }
+        if (item.content && !item.items) {
+          return {
+            title: item.title,
+            items: [{ type: 'text', content: formatContentBreaks(item.content) }],
+          }
+        }
+        if (Array.isArray(item.items)) {
+          return {
+            ...item,
+            items: item.items.map(healGenuiNode),
+          }
+        }
+        return item
+      })
+    }
+  } else if (node.type === 'steps') {
+    if (Array.isArray(node.items) && !node.steps) {
+      node.steps = node.items
+      delete node.items
+    }
+  } else if (node.type === 'badge') {
+    if (typeof node.tone === 'string') {
+      const t = node.tone.toLowerCase().trim()
+      if (t === 'warning') node.tone = 'warn'
+      else if (t === 'error') node.tone = 'danger'
+    }
+  } else if (node.type === 'card') {
+    if (node.label && !node.title) {
+      node.title = node.label
+      delete node.label
+    }
+  } else if (node.type === 'button') {
+    if (typeof node.tone === 'string') {
+      const t = node.tone.toLowerCase().trim()
+      if (t === 'default' || t === 'secondary') node.tone = 'ghost'
+    }
+  }
+
+  // 递归处理子元素
+  if (Array.isArray(node.items) && node.type !== 'accordion') {
+    node.items = node.items.map(healGenuiNode)
+  }
+  if (Array.isArray(node.steps)) {
+    node.steps = node.steps.map(healGenuiNode)
+  }
+  if (Array.isArray(node.tabs)) {
+    node.tabs = node.tabs.map((tab: any) => ({
+      ...tab,
+      items: Array.isArray(tab.items) ? tab.items.map(healGenuiNode) : tab.items,
+    }))
+  }
+
+  return node
+}
+
 function formatMessages(options: GenerateOptions): string {
   const parts: string[] = []
   if (options.system) {
-    parts.push(`[system]\n${options.system}`)
+    const hasGenUi = options.system.includes('dsh-ui')
+    const systemPrompt = hasGenUi ? `${options.system}\n${DSH_UI_SPEC_RULE}` : options.system
+    parts.push(`[system]\n${systemPrompt}`)
   }
+
   const messages = Array.isArray(options.messages) ? options.messages : []
   for (const message of messages) {
     if (!message) continue
@@ -499,27 +679,22 @@ export class DevinAdapter extends LlmAdapter {
         }
       }
 
-      // 获取当前 DSH 会话对象（用于发射原生 tool/call 和 tool/result 独立消息体）
+      // 解析工作目录
       const dshSessionId = (options as { sessionId?: string }).sessionId
-      let dshSession: any = (options as { session?: any }).session
-      if (!dshSession && dshSessionId && this.config.ctx) {
+      let effectiveCwd = this.config.cwd
+      if ((options as any).cwd) {
+        effectiveCwd = (options as any).cwd
+      } else if (dshSessionId && this.config.ctx) {
         try {
           const ctxAny = this.config.ctx as any
           const sessions = typeof ctxAny.get === 'function'
             ? ctxAny.get('sessions')
             : (typeof ctxAny.reflect?.get === 'function' ? ctxAny.reflect.get('sessions') : undefined)
-          dshSession = sessions?.get?.(dshSessionId)
-        } catch (err) {
-          console.warn('[dsh-devin-cli] Failed to safely resolve session from ctx:', err)
-          dshSession = undefined
+          const session = sessions?.get?.(dshSessionId)
+          if (session?.header?.cwd) effectiveCwd = session.header.cwd
+        } catch {
+          // ignore
         }
-      }
-
-      let effectiveCwd = this.config.cwd
-      if (dshSession?.header?.cwd) {
-        effectiveCwd = dshSession.header.cwd
-      } else if ((options as any).cwd) {
-        effectiveCwd = (options as any).cwd
       }
 
       const sessionParams: AcpSessionNewParams = {
@@ -556,93 +731,13 @@ export class DevinAdapter extends LlmAdapter {
       let blockIndex = 0
       let currentBlock: { type: 'reasoning' | 'text'; index: number; content: string } | null = null
 
-      let currentTurn = 0
-      let currentStep = 0
-      if (dshSession) {
-        try {
-          const events = dshSession.snapshotEvents ? dshSession.snapshotEvents() : (dshSession.log || [])
-          for (let i = events.length - 1; i >= 0; i--) {
-            const ev = events[i]
-            if (ev.type === 'step/start') {
-              currentStep = ev.data.step
-              currentTurn = ev.data.turn
-              break
-            }
-            if (ev.type === 'turn/start') {
-              currentTurn = ev.data.turn
-              break
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      // 跟踪在途工具调用：toolCallId -> { callSeq, name }
-      const activeToolCalls = new Map<string, { callSeq: number; name: string }>()
-
-      // 跟踪是否发生过工具调用，以保证调用轨迹自上而下正确排列（杜绝正文超前锚定导致工具沉底）
-      let hasToolCalls = false
-      let initialThoughtBuffer = ''
-      let initialTextBuffer = ''
-      let postToolThoughtBuffer = ''
-      let postToolTextBuffer = ''
-      let isPureChat = false
-
-      // 安全收敛所有在途工具卡片（用于流收尾或最终结算）
-      const settleActiveToolCalls = () => {
-        if (dshSession && typeof dshSession.append === 'function' && activeToolCalls.size > 0) {
-          for (const [toolCallId, active] of activeToolCalls) {
-            try {
-              const message = createToolResultMessage({
-                callId: ToolCallId(toolCallId),
-                content: [{ type: 'text', text: 'Done' }],
-                isError: false,
-              })
-              dshSession.append('tool/result', {
-                turn: currentTurn,
-                step: currentStep,
-                message,
-              }, {
-                surfaceOp: 'append',
-                sourceEventSeqs: active.callSeq ? [active.callSeq] : [],
-              })
-            } catch {
-              // ignore
-            }
-          }
-        }
-        activeToolCalls.clear()
-      }
-
-      // 纯对话阶段：将初始缓冲内容作为流式 delta 发射
-      const flushInitialBuffers = function* (): Generator<StreamChunk, void, unknown> {
-        if (isPureChat) return
-        isPureChat = true
-        if (initialThoughtBuffer) {
-          const { index, startChunk, endChunk } = ensureBlock('reasoning')
-          if (endChunk) yield endChunk
-          if (startChunk) yield startChunk
-          currentBlock!.content += initialThoughtBuffer
-          yield { type: 'reasoning-delta', index, text: initialThoughtBuffer }
-          initialThoughtBuffer = ''
-        }
-        if (initialTextBuffer) {
-          const { index, startChunk, endChunk } = ensureBlock('text')
-          if (endChunk) yield endChunk
-          if (startChunk) yield startChunk
-          currentBlock!.content += initialTextBuffer
-          yield { type: 'text-delta', index, text: initialTextBuffer }
-          initialTextBuffer = ''
-        }
-      }
-
       const endCurrentBlock = (): StreamChunk | null => {
         if (!currentBlock) return null
+        const content = currentBlock.type === 'text' ? healDshUiFences(currentBlock.content) : currentBlock.content
         const closed = {
           type: 'block-end' as const,
           index: currentBlock.index,
-          block: { type: currentBlock.type, text: currentBlock.content },
+          block: { type: currentBlock.type, text: content },
         }
         currentBlock = null
         return closed
@@ -689,18 +784,8 @@ export class DevinAdapter extends LlmAdapter {
           break
         }
 
-        // 处理工具调用开始：以 DSH 原生独立事件发射，在前端渲染为独立的工具调用卡片消息体
+        // 1. 处理工具调用开始：以动作块形式自然融入思考流，保证时序自上而下 100% 严格一致
         if (update.sessionUpdate === 'tool_call') {
-          hasToolCalls = true
-          isPureChat = false
-          // 既然触发了工具调用，彻底清空工具前暂存的零碎过渡短语或心声，防止在工具前建立过早的时间锚点导致工具卡片沉底
-          initialThoughtBuffer = ''
-          initialTextBuffer = ''
-
-          // 如果之前有尚未关闭的块，关闭它
-          const endChunk = endCurrentBlock()
-          if (endChunk) yield endChunk
-
           const tc = update as {
             title?: string
             kind?: string
@@ -708,117 +793,70 @@ export class DevinAdapter extends LlmAdapter {
             rawInput?: Record<string, unknown>
             _meta?: Record<string, unknown>
           }
-          if (dshSession && typeof dshSession.append === 'function') {
-            try {
-              const mapped = mapDevinToolNameToDsh(tc)
-              const toolCallId = tc.toolCallId || `devin_call_${Date.now()}`
-              const appendResult = dshSession.append('tool/call', {
-                turn: currentTurn,
-                step: currentStep,
-                callId: toolCallId,
-                name: mapped.name,
-                arguments: JSON.stringify(mapped.args),
-              })
-              const callSeq = appendResult?.seq ?? Date.now()
-              activeToolCalls.set(toolCallId, { callSeq, name: mapped.name })
-            } catch (err) {
-              console.warn('[dsh-devin-cli] Failed to append tool/call to session:', err)
-            }
-          }
+          const mapped = mapDevinToolNameToDsh(tc)
+          const argsSummary = formatArgsSummary(mapped.args)
+          const { index, startChunk, endChunk } = ensureBlock('reasoning')
+          if (endChunk) yield endChunk
+          if (startChunk) yield startChunk
+
+          const actionText = `\n\n> 🛠️ **执行工具: ${mapped.name}**${argsSummary ? ` \`${argsSummary}\`` : ''}\n`
+          currentBlock!.content += actionText
+          yield { type: 'reasoning-delta', index, text: actionText }
         }
-        // 处理工具调用完成/失败状态：更新对应的独立工具卡片为完成并回填输出结果
+        // 2. 处理工具调用完成/更新：回填工具执行简报
         else if (update.sessionUpdate === 'tool_call_update') {
           const tcu = update as {
-            toolCallId?: string
-            callId?: string
-            id?: string
             status?: string
             isError?: boolean
             content?: Array<{ type?: string; content?: { type?: string; text?: string } }>
           }
-          const resolvedToolCallId = tcu.toolCallId || tcu.callId || tcu.id
-          if (dshSession && typeof dshSession.append === 'function' && resolvedToolCallId) {
-            const active = activeToolCalls.get(resolvedToolCallId)
-            const status = (tcu.status || '').toLowerCase()
-            const isFinished = status === 'completed' || status === 'failed' || status === 'success' || status === 'done' || status === 'finished' || status === 'error' || tcu.isError !== undefined
-            if (active && (isFinished || !status)) {
-              activeToolCalls.delete(resolvedToolCallId)
-              try {
-                let outputText = ''
-                if (Array.isArray(tcu.content)) {
-                  for (const item of tcu.content) {
-                    if (item.content?.text) outputText += item.content.text
-                  }
-                }
-                const isError = status === 'failed' || status === 'error' || Boolean(tcu.isError)
-                const message = createToolResultMessage({
-                  callId: ToolCallId(resolvedToolCallId),
-                  content: [{ type: 'text', text: outputText || (isError ? 'Tool execution failed' : 'Done') }],
-                  isError,
-                })
-                dshSession.append('tool/result', {
-                  turn: currentTurn,
-                  step: currentStep,
-                  message,
-                }, {
-                  surfaceOp: 'append',
-                  sourceEventSeqs: active.callSeq ? [active.callSeq] : [],
-                })
-              } catch (err) {
-                console.warn('[dsh-devin-cli] Failed to append tool/result to session:', err)
+          const status = (tcu.status || '').toLowerCase()
+          const isFinished = status === 'completed' || status === 'failed' || status === 'success' || status === 'done' || status === 'finished' || status === 'error' || tcu.isError !== undefined
+          if (isFinished || !status) {
+            let outputText = ''
+            if (Array.isArray(tcu.content)) {
+              for (const item of tcu.content) {
+                if (item.content?.text) outputText += item.content.text
               }
             }
+            const isError = status === 'failed' || status === 'error' || Boolean(tcu.isError)
+            const summary = formatOutputSummary(outputText)
+            const resultText = `> ↳ ${isError ? '❌ 失败' : '✅ 完成'}${summary ? `: ${summary}` : ''}\n\n`
+
+            const { index, startChunk, endChunk } = ensureBlock('reasoning')
+            if (endChunk) yield endChunk
+            if (startChunk) yield startChunk
+            currentBlock!.content += resultText
+            yield { type: 'reasoning-delta', index, text: resultText }
           }
         }
-        // 处理深度思考流
+        // 3. 处理深度思考流：实时打字输出
         else if (update.sessionUpdate === 'agent_thought_chunk') {
           const thought = update as { content?: { type?: string; text?: string } }
           const text = thought.content?.text
           if (text) {
-            if (hasToolCalls) {
-              // 发生过工具调用：严格缓冲思考，绝不提前 yield，杜绝破坏工具调用的前置时序
-              postToolThoughtBuffer += text
-            } else if (isPureChat) {
-              // 纯对话直通模式：实时流式输出
-              const { index, startChunk, endChunk } = ensureBlock('reasoning')
-              if (endChunk) yield endChunk
-              if (startChunk) yield startChunk
-              currentBlock!.content += text
-              yield { type: 'reasoning-delta', index, text }
-            } else {
-              // 尚未发生工具调用的探测期：暂存思考
-              initialThoughtBuffer += text
-            }
+            const { index, startChunk, endChunk } = ensureBlock('reasoning')
+            if (endChunk) yield endChunk
+            if (startChunk) yield startChunk
+            currentBlock!.content += text
+            yield { type: 'reasoning-delta', index, text }
           }
         }
-        // 处理正文回复流
+        // 4. 处理正式回复流：切换到正文块实时打字输出（同时自动收束之前的 reasoning 块）
         else if (update.sessionUpdate === 'agent_message_chunk') {
           const chunk = update as AcpAgentMessageChunk
           const contents = Array.isArray(chunk.content) ? chunk.content : [chunk.content]
           for (const content of contents) {
             if (content.type === 'text' && content.text) {
-              if (hasToolCalls) {
-                // 发生过工具调用：严格缓冲正文结论，绝不在工具完成前提前 yield！
-                postToolTextBuffer += content.text
-              } else if (isPureChat) {
-                // 纯对话直通模式：实时流式打字输出
-                const { index, startChunk, endChunk } = ensureBlock('text')
-                if (endChunk) yield endChunk
-                if (startChunk) yield startChunk
-                currentBlock!.content += content.text
-                yield { type: 'text-delta', index, text: content.text }
-              } else {
-                // 探测期：暂存文本
-                initialTextBuffer += content.text
-                // 仅当文字累积较多（超过 120 字）且从来没有工具调用时，判定为纯对话问答，开启直通流
-                if (initialTextBuffer.length > 120) {
-                  yield* flushInitialBuffers()
-                }
-              }
+              const { index, startChunk, endChunk } = ensureBlock('text')
+              if (endChunk) yield endChunk
+              if (startChunk) yield startChunk
+              currentBlock!.content += content.text
+              yield { type: 'text-delta', index, text: content.text }
             }
           }
         }
-        // 处理 token 用量更新
+        // 5. 处理 token 用量更新
         else if (update.sessionUpdate === 'usage_update') {
           const usage = update as AcpUsageUpdate & { used?: number; totalTokens?: number }
           if (typeof usage.inputTokens === 'number' || typeof usage.outputTokens === 'number') {
@@ -835,33 +873,6 @@ export class DevinAdapter extends LlmAdapter {
             }
           }
         }
-      }
-
-      if (hasToolCalls) {
-        // 1. 确保结算所有在途工具卡片，写入对应的 tool/result（保证工具全部固化在 session 中）
-        settleActiveToolCalls()
-
-        // 2. 在所有工具卡片已固化在 session 之后，开始在工具下方发射最终的思考与正文：
-        if (postToolThoughtBuffer) {
-          const { index, startChunk, endChunk } = ensureBlock('reasoning')
-          if (endChunk) yield endChunk
-          if (startChunk) yield startChunk
-          currentBlock!.content += postToolThoughtBuffer
-          yield { type: 'reasoning-delta', index, text: postToolThoughtBuffer }
-          const closeThought = endCurrentBlock()
-          if (closeThought) yield closeThought
-        }
-
-        if (postToolTextBuffer) {
-          const { index, startChunk, endChunk } = ensureBlock('text')
-          if (endChunk) yield endChunk
-          if (startChunk) yield startChunk
-          currentBlock!.content += postToolTextBuffer
-          yield { type: 'text-delta', index, text: postToolTextBuffer }
-        }
-      } else {
-        // 纯对话模式收尾：若缓冲区仍有残留内容（如短问答），在流收尾前完整输出
-        yield* flushInitialBuffers()
       }
 
       // 收尾当前尚未关闭的内容块
