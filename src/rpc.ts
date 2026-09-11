@@ -131,14 +131,30 @@ export function installDevinRpc(ctx: Context, options: DevinRpcOptions = {}): vo
     }
   }
 
+  const registerOnConnection = (conn: HostConnectionLike) => {
+    try {
+      console.log('[dsh-devin-cli] Registering RPC channel /devin-cli')
+      return conn.rpc.handle(
+        '/devin-cli',
+        (endpoint, payload, signal) => handleRpc(endpoint, payload, signal),
+      )
+    } catch (err) {
+      console.warn('[dsh-devin-cli] Failed to register RPC on connection:', err)
+    }
+  }
+
+  const existingConn = (ctx as any).connection as HostConnectionLike | undefined
+  if (existingConn?.rpc?.handle) {
+    registerOnConnection(existingConn)
+  }
+
   ctx.inject(['connection'], (connCtx) => {
     const connection = (connCtx as unknown as { connection: HostConnectionLike }).connection
-    const dispose = connection.rpc.handle(
-      '/devin-cli',
-      (endpoint, payload, signal) => handleRpc(endpoint, payload, signal),
-    )
-    return () => {
-      dispose?.()
+    if (connection?.rpc?.handle) {
+      const dispose = registerOnConnection(connection)
+      return () => {
+        dispose?.()
+      }
     }
   })
 }
