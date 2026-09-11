@@ -57,11 +57,27 @@ interface StatusPayload {
 }
 
 async function rpcCall<T>(conn: ConnectionRpc, endpoint: string, payload: unknown = {}): Promise<T> {
-  let result: RpcResultLike
+  let result: RpcResultLike | undefined
   try {
     result = await conn.call('/devin-cli', endpoint, payload ?? {})
   } catch (err) {
-    throw new Error(`无法连接 Devin CLI 服务: ${err instanceof Error ? err.message : String(err)}`)
+    // 兼容回退：当 DSH 0.1.5-rc.1 的 connection.rpc.handle 未能挂载路由时，直接请求 webServer 降级接口
+    try {
+      const resp = await fetch(`/devin-cli/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId: 'client-fallback', method: endpoint, payload }),
+      })
+      if (resp.ok) {
+        const json = (await resp.json()) as any
+        result = json?.result
+      }
+    } catch {
+      // ignore
+    }
+    if (!result) {
+      throw new Error(`无法连接 Devin CLI 服务: ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
   if (result && result.ok === true) return result.value as T
   const error = result && result.ok === false ? result.error : undefined

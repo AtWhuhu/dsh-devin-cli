@@ -1,3 +1,4 @@
+import path from 'node:path'
 import {
   LlmAdapter,
   LlmError,
@@ -436,15 +437,36 @@ function healGenuiNode(node: any): any {
 
 function formatMessages(options: GenerateOptions): string {
   const parts: string[] = []
-  if (options.system) {
-    const hasGenUi = options.system.includes('dsh-ui')
-    const systemPrompt = hasGenUi ? `${options.system}\n${DSH_UI_SPEC_RULE}` : options.system
+
+  // 1. 收集 System Prompt（兼容 0.1.2 的 options.system 与 0.1.5 的 message.role === 'system' 消息历史）
+  const systemTexts: string[] = []
+  if (options.system && typeof options.system === 'string') {
+    systemTexts.push(options.system)
+  }
+
+  const rawMessages = Array.isArray(options.messages) ? options.messages : []
+  for (const msg of rawMessages) {
+    if (!msg) continue
+    if (msg.role === 'system') {
+      const blocks = Array.isArray(msg.content) ? msg.content : []
+      for (const block of blocks) {
+        if (block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
+          systemTexts.push(block.text)
+        }
+      }
+    }
+  }
+
+  if (systemTexts.length > 0) {
+    const rawSysPrompt = systemTexts.join('\n\n')
+    const hasGenUi = rawSysPrompt.includes('dsh-ui')
+    const systemPrompt = hasGenUi ? `${rawSysPrompt}\n${DSH_UI_SPEC_RULE}` : rawSysPrompt
     parts.push(`[system]\n${systemPrompt}`)
   }
 
-  const messages = Array.isArray(options.messages) ? options.messages : []
-  for (const message of messages) {
-    if (!message) continue
+  // 2. 遍历普通对话历史（过滤掉已提前提取并置顶的 system 消息）
+  for (const message of rawMessages) {
+    if (!message || message.role === 'system') continue
     const role = message.role === 'assistant' ? 'assistant' : message.source?.kind === 'tool' ? 'tool' : 'user'
     parts.push(`[${role}]`)
     const blocks = Array.isArray(message.content) ? message.content : []
@@ -473,8 +495,11 @@ function formatMessages(options: GenerateOptions): string {
         }
         const errPrefix = block.isError ? 'ERROR: ' : ''
         parts.push(`[Tool Result for ${block.toolCallId || ''}]: ${errPrefix}${texts.join('\n')}`)
+      } else if (block.type === 'image') {
+        const mime = (block as any).mimeType || (block as any).mediaType || 'image/png'
+        parts.push(`[image: ${mime}]`)
       } else {
-        // 其他未知块（如 image 等）安全序列化为文本
+        // 其他未知块安全序列化为文本
         try {
           parts.push(JSON.stringify(block))
         } catch {
@@ -696,6 +721,7 @@ export class DevinAdapter extends LlmAdapter {
           // ignore
         }
       }
+      effectiveCwd = path.isAbsolute(effectiveCwd) ? effectiveCwd : path.resolve(process.cwd(), effectiveCwd)
 
       const sessionParams: AcpSessionNewParams = {
         cwd: effectiveCwd,

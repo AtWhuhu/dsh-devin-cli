@@ -51,8 +51,8 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-settings": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1",
+    "@deepseek-ai/dsh-settings": ">=0.1.2-rc.1",
     "@deepseek-ai/schemastery": ">=3.18.0"
   },
   "devDependencies": {

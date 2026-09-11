@@ -14,7 +14,7 @@ import { loadSettings } from './storage.ts'
 import { discoverDevinModels } from './models.ts'
 
 export const name = 'dsh-devin-cli'
-export const inject = ['llm', 'connection', 'settings']
+export const inject = ['llm', 'connection', 'settings', 'webServer']
 
 const SETTINGS_NS = 'dsh-devin-cli' as const
 

@@ -133,17 +133,90 @@ export function installDevinRpc(ctx: Context, options: DevinRpcOptions = {}): vo
 
   ctx.effect(() => {
     let unregister: (() => void) | undefined
+    let unregisterWebServer: (() => void) | undefined
 
     const register = (conn: HostConnectionLike) => {
       if (unregister || !conn?.rpc?.handle) return
       try {
-        console.log('[dsh-devin-cli] Registering RPC channel /devin-cli')
         unregister = conn.rpc.handle(
           '/devin-cli',
           (endpoint, payload, signal) => handleRpc(endpoint, payload, signal),
         )
+      } catch (err: any) {
+        const msg = String(err?.message || err)
+        // 遇到 DSH 官方 connection.rpc.handle 缺失 webServer inject 声明的已知缺陷，静默交由下方 webServer 路由处理
+        if (!msg.includes('webServer') && !msg.includes('without inject')) {
+          console.warn('[dsh-devin-cli] Failed to register RPC on connection:', msg)
+        }
+      }
+    }
+
+    // 双轨兜底：针对 DSH 0.1.5-rc.1 官方已知回归缺陷（connection.rpc.handle 无法解析 webServer 导致第三方 RPC 路由 404）
+    // 直接向 webServer 挂载 /devin-cli 前缀路由，保证设置面板与控制端点 100% 可达
+    const attachWebServer = (server: any) => {
+      if (unregisterWebServer || !server?.register) return
+      try {
+        const routePath = '/devin-cli'
+        if (server.prefix && typeof server.prefix.has === 'function' && server.prefix.has(routePath)) {
+          try {
+            server.prefix.delete(routePath)
+          } catch {}
+        }
+        unregisterWebServer = server.register({
+          kind: 'prefix',
+          path: routePath,
+          handler: async (req: any, res: any) => {
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+            if (req.method === 'OPTIONS') {
+              res.writeHead(204)
+              res.end()
+              return
+            }
+            if (req.method === 'GET') {
+              res.setHeader('Content-Type', 'application/json; charset=utf-8')
+              res.writeHead(200)
+              res.end(JSON.stringify({ ok: true, name: 'dsh-devin-cli' }))
+              return
+            }
+            if (req.method !== 'POST') {
+              res.writeHead(405)
+              res.end('Method Not Allowed')
+              return
+            }
+            const url = new URL(req.url, 'http://localhost')
+            const endpoint = url.pathname.replace(/^\/devin-cli\/?/, '')
+            let body = ''
+            req.on('data', (c: any) => { body += c })
+            req.on('end', async () => {
+              try {
+                const parsed = body ? JSON.parse(body) : {}
+                const rpcId = parsed.rpcId || 'devin-fallback'
+                const payload = parsed.payload ?? {}
+                const result = await handleRpc(endpoint, payload, new AbortController().signal)
+                res.setHeader('Content-Type', 'application/json; charset=utf-8')
+                res.writeHead(200)
+                res.end(JSON.stringify({
+                  type: 'server-response',
+                  rpcId,
+                  result,
+                }))
+              } catch (e: any) {
+                res.setHeader('Content-Type', 'application/json; charset=utf-8')
+                res.writeHead(200)
+                res.end(JSON.stringify({
+                  type: 'server-response',
+                  rpcId: 'error',
+                  result: { ok: false, error: { code: 'devin-cli/error', message: e.message, details: {} } },
+                }))
+              }
+            })
+          },
+        })
+        console.log('[dsh-devin-cli] Registered webServer fallback prefix route /devin-cli')
       } catch (err) {
-        console.warn('[dsh-devin-cli] Failed to register RPC on connection:', err)
+        console.warn('[dsh-devin-cli] Failed to register webServer fallback route:', err)
       }
     }
 
@@ -157,10 +230,23 @@ export function installDevinRpc(ctx: Context, options: DevinRpcOptions = {}): vo
       })
     }
 
+    const existingWebServer = (ctx as any).webServer
+    if (existingWebServer) {
+      attachWebServer(existingWebServer)
+    } else {
+      ctx.inject(['webServer'], (wsCtx: any) => {
+        attachWebServer(wsCtx.webServer)
+      })
+    }
+
     return () => {
       if (unregister) {
         unregister()
         unregister = undefined
+      }
+      if (unregisterWebServer) {
+        unregisterWebServer()
+        unregisterWebServer = undefined
       }
     }
   }, 'dsh-devin-cli: rpc channel')
