@@ -159,7 +159,7 @@ export class AcpStdioClient {
     return this.request<unknown>('authenticate', { methodId, ...(meta ? { meta } : {}) }, timeoutMs)
   }
 
-  sessionNew(params: AcpSessionNewParams, timeoutMs = 15_000): Promise<AcpSessionNewResult> {
+  sessionNew(params: AcpSessionNewParams, timeoutMs = 30_000): Promise<AcpSessionNewResult> {
     return this.request<AcpSessionNewResult>('session/new', params, timeoutMs)
   }
 

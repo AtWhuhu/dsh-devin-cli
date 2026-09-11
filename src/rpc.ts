@@ -131,30 +131,37 @@ export function installDevinRpc(ctx: Context, options: DevinRpcOptions = {}): vo
     }
   }
 
-  const registerOnConnection = (conn: HostConnectionLike) => {
-    try {
-      console.log('[dsh-devin-cli] Registering RPC channel /devin-cli')
-      return conn.rpc.handle(
-        '/devin-cli',
-        (endpoint, payload, signal) => handleRpc(endpoint, payload, signal),
-      )
-    } catch (err) {
-      console.warn('[dsh-devin-cli] Failed to register RPC on connection:', err)
-    }
-  }
+  ctx.effect(() => {
+    let unregister: (() => void) | undefined
 
-  const existingConn = (ctx as any).connection as HostConnectionLike | undefined
-  if (existingConn?.rpc?.handle) {
-    registerOnConnection(existingConn)
-  }
-
-  ctx.inject(['connection'], (connCtx) => {
-    const connection = (connCtx as unknown as { connection: HostConnectionLike }).connection
-    if (connection?.rpc?.handle) {
-      const dispose = registerOnConnection(connection)
-      return () => {
-        dispose?.()
+    const register = (conn: HostConnectionLike) => {
+      if (unregister || !conn?.rpc?.handle) return
+      try {
+        console.log('[dsh-devin-cli] Registering RPC channel /devin-cli')
+        unregister = conn.rpc.handle(
+          '/devin-cli',
+          (endpoint, payload, signal) => handleRpc(endpoint, payload, signal),
+        )
+      } catch (err) {
+        console.warn('[dsh-devin-cli] Failed to register RPC on connection:', err)
       }
     }
-  })
+
+    const existingConn = (ctx as any).connection as HostConnectionLike | undefined
+    if (existingConn?.rpc?.handle) {
+      register(existingConn)
+    } else {
+      ctx.inject(['connection'], (connCtx) => {
+        const conn = (connCtx as unknown as { connection: HostConnectionLike }).connection
+        register(conn)
+      })
+    }
+
+    return () => {
+      if (unregister) {
+        unregister()
+        unregister = undefined
+      }
+    }
+  }, 'dsh-devin-cli: rpc channel')
 }
