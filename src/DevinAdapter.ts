@@ -443,6 +443,61 @@ function healGenuiNode(node: any): any {
   return node
 }
 
+/**
+ * 本地生成会话标题，完全不触碰 Devin ACP。
+ *
+ * DSH 的 dsh-session-title-llm 会把人类消息包成 JSON 数组再发来：
+ *   system: "Create a concise title for an AI coding-assistant session..."
+ *    user : "Generate the session title from this JSON array of human messages:\n[...]"
+ * 这里尽量把 JSON 还原成自然语言；解析失败就退回原文截断，绝不因此报错。
+ */
+function deriveLocalTitle(options: GenerateOptions): string {
+  const messages = Array.isArray(options.messages) ? options.messages : []
+  let raw = ''
+  for (const message of messages) {
+    const blocks = Array.isArray(message?.content) ? message.content : []
+    for (const block of blocks) {
+      if (block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
+        raw += `${block.text}\n`
+      }
+    }
+  }
+
+  let source = raw
+  const jsonStart = raw.indexOf('[')
+  if (jsonStart !== -1) {
+    try {
+      const parsed: unknown = JSON.parse(raw.slice(jsonStart))
+      if (Array.isArray(parsed)) {
+        const texts: string[] = []
+        for (const item of parsed) {
+          const blocks = Array.isArray((item as { content?: unknown })?.content)
+            ? (item as { content: unknown[] }).content
+            : []
+          for (const block of blocks) {
+            if (block && typeof block === 'object' && (block as { type?: string }).type === 'text') {
+              const text = (block as { text?: unknown }).text
+              if (typeof text === 'string') texts.push(text)
+            }
+          }
+        }
+        if (texts.length > 0) source = texts.join(' ')
+      }
+    } catch {
+      // 结构变化时退回原文截断
+    }
+  }
+
+  const cleaned = source
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[`*#>_~|[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (!cleaned) return 'Devin 会话'
+  return cleaned.length > 32 ? `${cleaned.slice(0, 32)}…` : cleaned
+}
+
 function formatMessages(options: GenerateOptions): string {
   const parts: string[] = []
 
@@ -548,8 +603,10 @@ export class DevinAdapter extends LlmAdapter {
   }
 
   clearCache(): void {
+    // 仅失效模型目录缓存。绝不在此 disposeClient()：
+    // 设置面板每次变更（甚至只是 UI 同步）都会走到这里，一旦销毁 daemon
+    // 就会连带清空所有会话绑定，导致每轮都重建 Devin 会话。
     this.cachedModels = null
-    this.disposeClient()
   }
 
   disposeClient(): void {
@@ -632,7 +689,7 @@ export class DevinAdapter extends LlmAdapter {
     this.client = client
 
     // 初始化握手（30s 缓冲）
-    const init = await client.initialize({ name: 'dsh-devin-cli', version: '0.4.0' }, 30_000)
+    const init = await client.initialize({ name: 'dsh-devin-cli', version: '0.4.2' }, 30_000)
 
     // 认证（仅当存在明确的 api_key 类型且传入 token 时）
     if (token && init.authMethods?.length) {
@@ -761,6 +818,22 @@ export class DevinAdapter extends LlmAdapter {
   }
 
   override async *stream(options: GenerateOptions, signal?: AbortSignal): AsyncIterable<StreamChunk> {
+    // ─── 辅助用途请求拦截 ─────────────────────────────────────────────────────
+    // DSH 会在同一 provider 上额外发起「会话标题生成」请求（purpose: 'session-title'）。
+    // 它不是真实对话：若放行到 Devin，每个 DSH 会话都会多出一个垃圾 Devin 会话，
+    // 且它不带 reasoningEffort，会让 targetModel 抖动并触发 daemon 重建、连累主会话。
+    // 因此这里直接本地作答，零 ACP 调用、零 Devin 会话。
+    const purpose = (options as { purpose?: 'compaction' | 'session-title' }).purpose
+    if (purpose === 'session-title') {
+      const title = deriveLocalTitle(options)
+      console.log(`[dsh-devin-cli] Local session title (no Devin session created): ${title}`)
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text: title }
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: title } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+
     const queue = new AsyncQueue<AcpSessionUpdate | { done: true; usage?: TokenUsage; cancelled?: boolean }>()
     let acpSessionId: string | undefined
 
@@ -785,7 +858,10 @@ export class DevinAdapter extends LlmAdapter {
     const token = this.config.token ?? ''
 
     // 解析工作目录与 DSH 会话 ID
-    const dshSessionId = (options as { sessionId?: string }).sessionId || 'default'
+    // compaction 同为辅助请求，统一挂到 daemon 级共享会话，避免污染真实对话与制造垃圾会话
+    const dshSessionId = purpose === 'compaction'
+      ? '__aux__'
+      : ((options as { sessionId?: string }).sessionId || 'default')
     let effectiveCwd = this.config.cwd
     if ((options as any).cwd) {
       effectiveCwd = (options as any).cwd
@@ -1018,10 +1094,13 @@ export class DevinAdapter extends LlmAdapter {
       const msg = error instanceof Error ? (error.stack || error.message) : String(error)
       const tail = this.client?.getStderrTail().trim() || 'none'
       console.error('[dsh-devin-cli] Stream exception:', error)
+      // 只解绑当前这一个会话，绝不 disposeClient()：否则一次偶发失败会清空全部会话绑定，
+      // 导致后续每一轮都重新 sessionNew，制造大量垃圾会话。
+      // 若 daemon 真的死了，AcpStdioClient 的 onClose 会负责整体清理。
       if (acpSessionId) {
         this.dshToAcpSessions.delete(dshSessionId)
+        this.activeQueues.delete(acpSessionId)
       }
-      this.disposeClient()
       throw new LlmError(`Devin ACP stream failed: ${msg} (stderr tail: ${tail})`, 'TRANSPORT', { cause: error as Error })
     } finally {
       if (acpSessionId) {
