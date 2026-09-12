@@ -254,6 +254,14 @@ class AsyncQueue<T> {
       this.waiters.push(onDone)
     })
   }
+
+  close(): void {
+    while (this.waiters.length > 0) {
+      const waiter = this.waiters.shift()
+      if (waiter) waiter(undefined)
+    }
+    this.items = []
+  }
 }
 
 const DSH_UI_SPEC_RULE = `
@@ -522,6 +530,15 @@ function toAcpPrompt(options: GenerateOptions): AcpPromptContent[] {
 export class DevinAdapter extends LlmAdapter {
   private cachedModels: readonly DevinModelInfo[] | null = null
 
+  // ─── 长驻 Daemon 与 DSH 会话 1:1 映射管理 ────────────────────────────────
+  private client: AcpStdioClient | null = null
+  private clientReady: Promise<void> | null = null
+  private clientModel: string | null = null
+  private clientCwd: string | null = null
+  private switchingPromise: Promise<void> | null = null
+  private readonly dshToAcpSessions = new Map<string, string>()
+  private readonly activeQueues = new Map<string, AsyncQueue<AcpSessionUpdate | { done: true; usage?: TokenUsage; cancelled?: boolean }>>()
+
   constructor(private readonly config: DevinAdapterConfig) {
     super()
   }
@@ -532,6 +549,102 @@ export class DevinAdapter extends LlmAdapter {
 
   clearCache(): void {
     this.cachedModels = null
+    this.disposeClient()
+  }
+
+  disposeClient(): void {
+    if (this.client) {
+      try { this.client.close() } catch { /* ignore */ }
+      this.client = null
+    }
+    this.clientReady = null
+    this.clientModel = null
+    this.clientCwd = null
+    this.switchingPromise = null
+    this.dshToAcpSessions.clear()
+    for (const queue of this.activeQueues.values()) {
+      queue.push({ done: true, cancelled: false })
+      queue.close()
+    }
+    this.activeQueues.clear()
+  }
+
+  private ensureClient(model: string | undefined, cwd: string, token: string): Promise<void> {
+    if (this.client && this.clientModel === model && this.clientCwd === cwd && this.clientReady) {
+      return this.clientReady
+    }
+    if (this.client && (this.clientModel !== model || this.clientCwd !== cwd)) {
+      if (this.switchingPromise) return this.switchingPromise
+      this.switchingPromise = (this.clientReady ?? Promise.resolve()).catch(() => {})
+        .then(() => { this.disposeClient() })
+        .then(() => {
+          this.clientModel = model ?? null
+          this.clientCwd = cwd
+          this.clientReady = this.spawnAndInit(model, cwd, token)
+          return this.clientReady
+        })
+        .finally(() => { this.switchingPromise = null })
+      return this.switchingPromise
+    }
+    this.clientModel = model ?? null
+    this.clientCwd = cwd
+    this.clientReady = this.spawnAndInit(model, cwd, token)
+    return this.clientReady
+  }
+
+  private async spawnAndInit(model: string | undefined, cwd: string, token: string): Promise<void> {
+    const argv = [this.config.bin, 'acp']
+    if (model) argv.push('--model', model)
+
+    console.log(`[dsh-devin-cli] Spawning long-lived Devin ACP daemon (model: ${model || 'default'}, cwd: ${cwd})`)
+
+    const client = new AcpStdioClient({
+      argv,
+      cwd,
+      env: token ? { WINDSURF_API_KEY: token } : undefined,
+      onUpdate: (update, sessionId) => {
+        if (sessionId) {
+          const queue = this.activeQueues.get(sessionId)
+          if (queue) queue.push(update)
+        } else {
+          for (const queue of this.activeQueues.values()) {
+            queue.push(update)
+          }
+        }
+      },
+      onPermissionRequest: (request) => this.handlePermission(request),
+      onClose: (err) => {
+        console.warn('[dsh-devin-cli] Devin ACP daemon closed:', err?.message)
+        for (const queue of this.activeQueues.values()) {
+          queue.push({ done: true, cancelled: false })
+          queue.close()
+        }
+        this.activeQueues.clear()
+        this.dshToAcpSessions.clear()
+        this.client = null
+        this.clientReady = null
+        this.clientModel = null
+        this.clientCwd = null
+        this.switchingPromise = null
+      },
+    })
+
+    this.client = client
+
+    // 初始化握手（30s 缓冲）
+    const init = await client.initialize({ name: 'dsh-devin-cli', version: '0.4.0' }, 30_000)
+
+    // 认证（仅当存在明确的 api_key 类型且传入 token 时）
+    if (token && init.authMethods?.length) {
+      const apiKeyMethod = init.authMethods.find((m) => m.type === 'api_key' && m.id)
+      if (apiKeyMethod) {
+        try {
+          await client.authenticate(apiKeyMethod.id, { api_key: token }, 10_000)
+        } catch {
+          // 回退到本机凭据
+        }
+      }
+    }
   }
 
   override async listModels(_provider?: string): Promise<readonly DevinModelInfo[]> {
@@ -669,69 +782,59 @@ export class DevinAdapter extends LlmAdapter {
     )
     const targetModel = route.resolvedModelUid
 
-    const argv = [this.config.bin, 'acp']
-    if (targetModel) argv.push('--model', targetModel)
     const token = this.config.token ?? ''
 
-    console.log(`[dsh-devin-cli] Starting stream for model: ${options.model}, targetModel: ${targetModel}`)
+    // 解析工作目录与 DSH 会话 ID
+    const dshSessionId = (options as { sessionId?: string }).sessionId || 'default'
+    let effectiveCwd = this.config.cwd
+    if ((options as any).cwd) {
+      effectiveCwd = (options as any).cwd
+    } else if (dshSessionId && this.config.ctx) {
+      try {
+        const ctxAny = this.config.ctx as any
+        const sessions = typeof ctxAny.get === 'function'
+          ? ctxAny.get('sessions')
+          : (typeof ctxAny.reflect?.get === 'function' ? ctxAny.reflect.get('sessions') : undefined)
+        const session = sessions?.get?.(dshSessionId)
+        if (session?.header?.cwd) effectiveCwd = session.header.cwd
+      } catch {
+        // ignore
+      }
+    }
+    effectiveCwd = path.isAbsolute(effectiveCwd) ? effectiveCwd : path.resolve(process.cwd(), effectiveCwd)
 
-    const client = new AcpStdioClient({
-      argv,
-      cwd: this.config.cwd,
-      env: token ? { WINDSURF_API_KEY: token } : undefined,
-      onUpdate: (update) => queue.push(update),
-      onPermissionRequest: (request) => this.handlePermission(request),
-    })
+    if (signal?.aborted) throw new LlmError('Devin ACP request aborted before start', 'ABORTED')
+
+    // 确保长驻 daemon 就绪（同模型、同工作目录直接复用）
+    await this.ensureClient(targetModel, effectiveCwd, token)
+    const client = this.client
+    if (!client) throw new LlmError('Devin ACP client daemon not available', 'TRANSPORT')
+
+    // 会话复用核心：按 DSH 会话 1:1 映射复用 Devin ACP session，绝不重复生成垃圾会话
+    let isNewSession = false
+    acpSessionId = this.dshToAcpSessions.get(dshSessionId)
+    if (!acpSessionId) {
+      isNewSession = true
+      const sessionParams: AcpSessionNewParams = {
+        cwd: effectiveCwd,
+        mcpServers: [],
+      }
+      const acpSession = await client.sessionNew(sessionParams, 20_000)
+      acpSessionId = acpSession.sessionId
+      this.dshToAcpSessions.set(dshSessionId, acpSessionId)
+      console.log(`[dsh-devin-cli] Created NEW Devin ACP session: ${acpSessionId} for DSH session: ${dshSessionId}`)
+    } else {
+      console.log(`[dsh-devin-cli] REUSING Devin ACP session: ${acpSessionId} for DSH session: ${dshSessionId}`)
+    }
+
+    this.activeQueues.set(acpSessionId, queue)
 
     let promptDone = false
     let promptUsage: TokenUsage | undefined
 
     try {
-      if (signal?.aborted) throw new LlmError('Devin ACP request aborted before start', 'ABORTED')
-
-      // 初始化 ACP 服务握手（给予 30s 缓冲以应对冷启动）
-      const init = await client.initialize({ name: 'dsh-devin-cli', version: '0.3.0' }, 30_000)
-
-      // 仅当存在明确的 api_key 类型认证方法且传入了 token 时才调用 authenticate，避免触发 devin-browser 阻塞
-      if (token && init.authMethods?.length) {
-        const apiKeyMethod = init.authMethods.find((m) => m.type === 'api_key' && m.id)
-        if (apiKeyMethod) {
-          try {
-            await client.authenticate(apiKeyMethod.id, { api_key: token }, 10_000)
-          } catch {
-            // 如果显式认证失败，回退到本机 CLI 凭据
-          }
-        }
-      }
-
-      // 解析工作目录
-      const dshSessionId = (options as { sessionId?: string }).sessionId
-      let effectiveCwd = this.config.cwd
-      if ((options as any).cwd) {
-        effectiveCwd = (options as any).cwd
-      } else if (dshSessionId && this.config.ctx) {
-        try {
-          const ctxAny = this.config.ctx as any
-          const sessions = typeof ctxAny.get === 'function'
-            ? ctxAny.get('sessions')
-            : (typeof ctxAny.reflect?.get === 'function' ? ctxAny.reflect.get('sessions') : undefined)
-          const session = sessions?.get?.(dshSessionId)
-          if (session?.header?.cwd) effectiveCwd = session.header.cwd
-        } catch {
-          // ignore
-        }
-      }
-      effectiveCwd = path.isAbsolute(effectiveCwd) ? effectiveCwd : path.resolve(process.cwd(), effectiveCwd)
-
-      const sessionParams: AcpSessionNewParams = {
-        cwd: effectiveCwd,
-        mcpServers: [],
-      }
-      const acpSession = await client.sessionNew(sessionParams, 15_000)
-      acpSessionId = acpSession.sessionId
-
       const promptPayload = toAcpPrompt(options)
-      console.log(`[dsh-devin-cli] Prompting Devin ACP (session: ${acpSessionId}, length: ${promptPayload[0]?.text?.length || 0}, cwd: ${effectiveCwd})`)
+      console.log(`[dsh-devin-cli] Prompting Devin ACP (session: ${acpSessionId}, isNew: ${isNewSession}, length: ${promptPayload[0]?.text?.length || 0}, cwd: ${effectiveCwd})`)
 
       let promptError: Error | undefined
       client.prompt(acpSessionId, promptPayload)
@@ -805,6 +908,7 @@ export class DevinAdapter extends LlmAdapter {
             return
           }
           if (promptError) {
+            this.dshToAcpSessions.delete(dshSessionId)
             throw promptError
           }
           break
@@ -912,11 +1016,18 @@ export class DevinAdapter extends LlmAdapter {
     } catch (error) {
       if (error instanceof LlmError) throw error
       const msg = error instanceof Error ? (error.stack || error.message) : String(error)
-      const tail = client.getStderrTail().trim() || 'none'
+      const tail = this.client?.getStderrTail().trim() || 'none'
       console.error('[dsh-devin-cli] Stream exception:', error)
+      if (acpSessionId) {
+        this.dshToAcpSessions.delete(dshSessionId)
+      }
+      this.disposeClient()
       throw new LlmError(`Devin ACP stream failed: ${msg} (stderr tail: ${tail})`, 'TRANSPORT', { cause: error as Error })
     } finally {
-      client.close()
+      if (acpSessionId) {
+        this.activeQueues.delete(acpSessionId)
+      }
+      queue.close()
     }
   }
 

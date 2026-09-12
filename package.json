@@ -1,6 +1,6 @@
 {
   "name": "dsh-devin-cli",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "DSH LLM adapter plugin that connects local Devin CLI into DSH model provider via stdio ACP.",
   "license": "MIT",
   "type": "module",

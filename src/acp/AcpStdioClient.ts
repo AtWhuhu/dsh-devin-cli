@@ -20,10 +20,11 @@ export interface AcpStdioClientOptions {
   argv: string[]
   cwd: string
   env?: NodeJS.ProcessEnv
-  onUpdate: (update: AcpSessionUpdate) => void
+  onUpdate: (update: AcpSessionUpdate, sessionId?: string) => void
   onPermissionRequest?: (request: AcpPermissionRequestParams) => { outcome: { outcome: string; optionId?: string } } | undefined
   onGarbage?: (line: string) => void
   onStderr?: (chunk: string) => void
+  onClose?: (err?: Error) => void
 }
 
 export class AcpStdioClient {
@@ -83,7 +84,7 @@ export class AcpStdioClient {
 
       if (message.method === 'session/update') {
         const envelope = message.params as AcpSessionUpdateEnvelope
-        this.options.onUpdate(envelope.update)
+        this.options.onUpdate(envelope.update, envelope.sessionId)
         return
       }
       return
@@ -179,12 +180,18 @@ export class AcpStdioClient {
   close(error?: Error): void {
     if (this.closed) return
     this.closed = true
+    const err = error ?? new LlmError('acp: connection closed', 'TRANSPORT')
     for (const [, entry] of this.pending) {
-      entry.reject(error ?? new LlmError('acp: connection closed', 'TRANSPORT'))
+      entry.reject(err)
     }
     this.pending.clear()
     if (!this.process.killed) {
-      this.process.kill('SIGTERM')
+      try {
+        this.process.kill('SIGTERM')
+      } catch {
+        // ignore
+      }
     }
+    this.options.onClose?.(err)
   }
 }

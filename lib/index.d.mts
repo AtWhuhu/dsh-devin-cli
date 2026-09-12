@@ -64,9 +64,19 @@ declare function healDshUiFences(fullText: string): string;
 declare class DevinAdapter extends LlmAdapter {
   private readonly config;
   private cachedModels;
+  private client;
+  private clientReady;
+  private clientModel;
+  private clientCwd;
+  private switchingPromise;
+  private readonly dshToAcpSessions;
+  private readonly activeQueues;
   constructor(config: DevinAdapterConfig);
   providerInfo(_provider: string): LlmProviderInfo;
   clearCache(): void;
+  disposeClient(): void;
+  private ensureClient;
+  private spawnAndInit;
   listModels(_provider?: string): Promise<readonly DevinModelInfo[]>;
   resolveModel(_provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
   /**
@@ -263,7 +273,7 @@ interface AcpStdioClientOptions {
   argv: string[];
   cwd: string;
   env?: NodeJS.ProcessEnv;
-  onUpdate: (update: AcpSessionUpdate) => void;
+  onUpdate: (update: AcpSessionUpdate, sessionId?: string) => void;
   onPermissionRequest?: (request: AcpPermissionRequestParams) => {
     outcome: {
       outcome: string;
@@ -272,6 +282,7 @@ interface AcpStdioClientOptions {
   } | undefined;
   onGarbage?: (line: string) => void;
   onStderr?: (chunk: string) => void;
+  onClose?: (err?: Error) => void;
 }
 declare class AcpStdioClient {
   private readonly options;
